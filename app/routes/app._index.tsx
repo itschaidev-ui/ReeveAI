@@ -1,352 +1,281 @@
-import { useEffect } from "react";
+// app/routes/app._index.tsx — the Reeve AI dashboard, embedded in Shopify.
+//
+// Shows: live inventory summary (from Shopify), the AI chat panel (the hero),
+// and recent audit activity. All reads go through the authenticated admin
+// GraphQL client; chat POSTs to /app/chat.
+
+import { useEffect, useRef, useState } from "react";
 import type {
   ActionFunctionArgs,
   HeadersFunction,
   LoaderFunctionArgs,
 } from "react-router";
-import { useFetcher } from "react-router";
+import { useFetcher, useLoaderData } from "react-router";
 import { useAppBridge } from "@shopify/app-bridge-react";
 import { authenticate } from "../shopify.server";
 import { boundary } from "@shopify/shopify-app-react-router/server";
+import { getActivities } from "../lib/audit.server";
+import prisma from "../db.server";
+
+// ─── Loader: live inventory summary + recent activity ─────────────────────────
+
+interface InventorySummary {
+  total: number;
+  inStock: number;
+  lowStock: number;
+  outOfStock: number;
+  topLow: { id: string; title: string; inventory: number }[];
+}
 
 export const loader = async ({ request }: LoaderFunctionArgs) => {
-  await authenticate.admin(request);
+  const { admin, session } = await authenticate.admin(request);
+  const shop = session.shop;
 
-  return null;
-};
-
-export const action = async ({ request }: ActionFunctionArgs) => {
-  const { admin } = await authenticate.admin(request);
-  const color = ["Red", "Orange", "Yellow", "Green"][
-    Math.floor(Math.random() * 4)
-  ];
-  const response = await admin.graphql(
-    `#graphql
-      mutation populateProduct($product: ProductCreateInput!) {
-        productCreate(product: $product) {
-          product {
-            id
-            title
-            handle
-            status
-            variants(first: 10) {
-              edges {
-                node {
-                  id
-                  price
-                  barcode
-                  createdAt
-                }
-              }
-            }
-            demoInfo: metafield(namespace: "$app", key: "demo_info") {
-              jsonValue
-            }
-          }
-        }
-      }`,
-    {
-      variables: {
-        product: {
-          title: `${color} Snowboard`,
-          metafields: [
-            {
-              namespace: "$app",
-              key: "demo_info",
-              value: "Created by React Router Template",
-            },
-          ],
-        },
-      },
-    },
-  );
-  const responseJson = await response.json();
-
-  const product = responseJson.data!.productCreate!.product!;
-  const variantId = product.variants.edges[0]!.node!.id!;
-
-  const variantResponse = await admin.graphql(
-    `#graphql
-    mutation shopifyReactRouterTemplateUpdateVariant($productId: ID!, $variants: [ProductVariantsBulkInput!]!) {
-      productVariantsBulkUpdate(productId: $productId, variants: $variants) {
-        productVariants {
-          id
-          price
-          barcode
-          createdAt
-        }
+  // Live inventory from Shopify.
+  interface ProductsData {
+    products: { edges: Array<{ node: { id: string; title: string; variants: { edges: Array<{ node: { inventoryQuantity: number | null } }> } } }> };
+  }
+  const res = await admin.graphql(`#graphql
+    query DashboardProducts($first: Int!) {
+      products(first: $first) {
+        edges { node { id title variants(first: 5) { edges { node { inventoryQuantity } } } } }
       }
-    }`,
-    {
-      variables: {
-        productId: product.id,
-        variants: [{ id: variantId, price: "100.00" }],
-      },
-    },
-  );
+    }`, { variables: { first: 250 } });
+  const data = (await res.json()) as { data: ProductsData };
 
-  const variantResponseJson = await variantResponse.json();
+  let total = 0, inStock = 0, lowStock = 0, outOfStock = 0;
+  const lowList: { id: string; title: string; inventory: number }[] = [];
+  for (const e of data.data.products.edges) {
+    const minInv = Math.min(...e.node.variants.edges.map((v) => v.node.inventoryQuantity ?? 0));
+    total++;
+    if (minInv <= 0) outOfStock++;
+    else if (minInv <= 5) { lowStock++; lowList.push({ id: e.node.id, title: e.node.title, inventory: minInv }); }
+    else inStock++;
+  }
+  lowList.sort((a, b) => a.inventory - b.inventory);
 
-  const metaobjectResponse = await admin.graphql(
-    `#graphql
-    mutation shopifyReactRouterTemplateUpsertMetaobject($handle: MetaobjectHandleInput!, $values: JSON!) {
-      metaobjectUpsert(handle: $handle, values: $values) {
-        metaobject {
-          id
-          handle
-          values
-        }
-        userErrors {
-          field
-          message
-        }
-      }
-    }`,
-    {
-      variables: {
-        handle: {
-          type: "$app:example",
-          handle: "demo-entry",
-        },
-        values: {
-          title: "Demo Entry",
-          description:
-            "This metaobject was created by the Shopify app template to demonstrate the metaobject API.",
-        },
-      },
-    },
-  );
+  const summary: InventorySummary = { total, inStock, lowStock, outOfStock, topLow: lowList.slice(0, 5) };
 
-  const metaobjectResponseJson = await metaobjectResponse.json();
+  // Recent chat messages (so the conversation persists across reloads).
+  const messages = await prisma.chatMessage.findMany({
+    where: { shop },
+    orderBy: { createdAt: "desc" },
+    take: 20,
+  });
+  const activities = await getActivities(shop, 6);
 
   return {
-    product: responseJson!.data!.productCreate!.product,
-    variant:
-      variantResponseJson!.data!.productVariantsBulkUpdate!.productVariants,
-    metaobject: metaobjectResponseJson!.data!.metaobjectUpsert!.metaobject,
+    summary,
+    messages: messages.reverse().map((m) => ({
+      id: m.id,
+      role: m.role,
+      content: m.content,
+      actions: m.actionsJson ? JSON.parse(m.actionsJson) : null,
+    })),
+    activities: activities.map((a) => ({
+      id: a.id,
+      type: a.type,
+      severity: a.severity,
+      source: a.source,
+      message: a.message,
+      createdAt: a.createdAt,
+    })),
+    provider: process.env.NVIDIA_API_KEY ? "nvidia" : "demo",
   };
 };
 
-export default function Index() {
-  const fetcher = useFetcher<typeof action>();
+// ─── Component ──────────────────────────────────────────────────────────────────
 
+interface ChatAction { name: string; summary: string; ok: boolean; error?: string }
+interface Msg { id: string; role: string; content: string; actions: ChatAction[] | null }
+
+export default function ReeveDashboard() {
+  const { summary, messages: initialMessages, activities, provider } = useLoaderData<typeof loader>();
+  const fetcher = useFetcher<typeof loader>();
+  const chatFetcher = useFetcher<{ response?: string; actions?: ChatAction[]; provider?: string; error?: string }>();
   const shopify = useAppBridge();
-  const isLoading =
-    ["loading", "submitting"].includes(fetcher.state) &&
-    fetcher.formMethod === "POST";
+  const [messages, setMessages] = useState<Msg[]>(initialMessages);
+  const [input, setInput] = useState("");
+  const scrollRef = useRef<HTMLDivElement>(null);
+
+  // When the loader re-runs (after a chat action invalidates), refresh messages + summary.
+  useEffect(() => {
+    if (fetcher.data) {
+      setMessages(fetcher.data.messages);
+    }
+  }, [fetcher.data]);
 
   useEffect(() => {
-    if (fetcher.data?.product?.id) {
-      shopify.toast.show("Product created");
-    }
-  }, [fetcher.data?.product?.id, shopify]);
+    scrollRef.current?.scrollTo({ top: scrollRef.current.scrollHeight, behavior: "smooth" });
+  }, [messages, chatFetcher.state]);
 
-  const generateProduct = () => fetcher.submit({}, { method: "POST" });
+  const send = (text: string) => {
+    const trimmed = text.trim();
+    if (!trimmed || chatFetcher.state !== "idle") return;
+    setMessages((m) => [...m, { id: crypto.randomUUID(), role: "user", content: trimmed }]);
+    setInput("");
+    chatFetcher.submit({ message: trimmed }, { method: "POST", action: "/app/chat", encType: "application/json" });
+  };
+
+  // When the chat fetcher returns, append the agent reply + reload data.
+  useEffect(() => {
+    if (chatFetcher.data?.response && chatFetcher.state === "idle") {
+      setMessages((m) => [...m, {
+        id: crypto.randomUUID(),
+        role: "assistant",
+        content: chatFetcher.data.response!,
+        actions: chatFetcher.data.actions ?? null,
+      }]);
+      shopify.toast.show("Reeve replied");
+      // Reload loader to refresh inventory + activity.
+      fetcher.load("/app");
+    }
+    if (chatFetcher.data?.error) {
+      shopify.toast.show(chatFetcher.data.error, { isError: true });
+    }
+  }, [chatFetcher.data, chatFetcher.state]);
+
+  const onKeyDown = (e: React.KeyboardEvent) => {
+    if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); send(input); }
+  };
+
+  const isThinking = chatFetcher.state !== "idle";
 
   return (
-    <s-page heading="Shopify app template">
-      <s-button slot="primary-action" onClick={generateProduct}>
-        Generate a product
-      </s-button>
+    <s-page heading="Reeve AI — Inventory Agent">
+      <div slot="primary-action">
+        <s-badge tone={provider === "nvidia" ? "success" : "attention"}>
+          {provider === "nvidia" ? "Live AI" : "Demo mode"}
+        </s-badge>
+      </div>
 
-      <s-section heading="Congrats on creating a new Shopify app 🎉">
-        <s-paragraph>
-          This embedded app template uses{" "}
-          <s-link
-            href="https://shopify.dev/docs/apps/tools/app-bridge"
-            target="_blank"
-          >
-            App Bridge
-          </s-link>{" "}
-          interface examples like an{" "}
-          <s-link href="/app/additional">additional page in the app nav</s-link>
-          , as well as an{" "}
-          <s-link
-            href="https://shopify.dev/docs/api/admin-graphql"
-            target="_blank"
-          >
-            Admin GraphQL
-          </s-link>{" "}
-          mutation demo, to provide a starting point for app development.
-        </s-paragraph>
-      </s-section>
-      <s-section heading="Get started with products">
-        <s-paragraph>
-          Generate a product with GraphQL and get the JSON output for that
-          product. Learn more about the{" "}
-          <s-link
-            href="https://shopify.dev/docs/api/admin-graphql/latest/mutations/productCreate"
-            target="_blank"
-          >
-            productCreate
-          </s-link>{" "}
-          mutation in our API references. Includes a product{" "}
-          <s-link
-            href="https://shopify.dev/docs/apps/build/custom-data/metafields"
-            target="_blank"
-          >
-            metafield
-          </s-link>{" "}
-          and{" "}
-          <s-link
-            href="https://shopify.dev/docs/apps/build/custom-data/metaobjects"
-            target="_blank"
-          >
-            metaobject
-          </s-link>
-          .
-        </s-paragraph>
-        <s-stack direction="inline" gap="base">
-          <s-button
-            onClick={generateProduct}
-            {...(isLoading ? { loading: true } : {})}
-          >
-            Generate a product
-          </s-button>
-          {fetcher.data?.product && (
-            <s-button
-              onClick={() => {
-                shopify.intents.invoke?.("edit:shopify/Product", {
-                  value: fetcher.data?.product?.id,
-                });
-              }}
-              target="_blank"
-              variant="tertiary"
-            >
-              Edit product
-            </s-button>
-          )}
-        </s-stack>
-        {fetcher.data?.product && (
-          <s-section heading="productCreate mutation">
-            <s-stack direction="block" gap="base">
-              <s-box
-                padding="base"
-                borderWidth="base"
-                borderRadius="base"
-                background="subdued"
-              >
-                <pre
-                  style={{
-                    margin: 0,
-                    whiteSpace: "pre-wrap",
-                    wordBreak: "break-word",
-                  }}
-                >
-                  <code>{JSON.stringify(fetcher.data.product, null, 2)}</code>
-                </pre>
-              </s-box>
-
-              <s-heading>productVariantsBulkUpdate mutation</s-heading>
-              <s-box
-                padding="base"
-                borderWidth="base"
-                borderRadius="base"
-                background="subdued"
-              >
-                <pre
-                  style={{
-                    margin: 0,
-                    whiteSpace: "pre-wrap",
-                    wordBreak: "break-word",
-                  }}
-                >
-                  <code>{JSON.stringify(fetcher.data.variant, null, 2)}</code>
-                </pre>
-              </s-box>
-
-              <s-heading>metaobjectUpsert mutation</s-heading>
-              <s-box
-                padding="base"
-                borderWidth="base"
-                borderRadius="base"
-                background="subdued"
-              >
-                <pre
-                  style={{
-                    margin: 0,
-                    whiteSpace: "pre-wrap",
-                    wordBreak: "break-word",
-                  }}
-                >
-                  <code>
-                    {JSON.stringify(fetcher.data.metaobject, null, 2)}
-                  </code>
-                </pre>
-              </s-box>
+      {/* ─── KPI tiles ─── */}
+      <s-section heading="Inventory at a glance">
+        <s-stack direction="inline" gap="loose" wrap>
+          <s-box padding="base" borderWidth="base" borderRadius="base" background="subdued">
+            <s-stack direction="block" gap="none">
+              <s-text alignment="center" appearance="code">{summary.total}</s-text>
+              <s-text alignment="center" tone="subdued">Total products</s-text>
             </s-stack>
-          </s-section>
+          </s-box>
+          <s-box padding="base" borderWidth="base" borderRadius="base" background="subdued">
+            <s-stack direction="block" gap="none">
+              <s-text alignment="center" appearance="code">{summary.inStock}</s-text>
+              <s-text alignment="center" tone="subdued">In stock</s-text>
+            </s-stack>
+          </s-box>
+          <s-box padding="base" borderWidth="base" borderRadius="base" background="subdued">
+            <s-stack direction="block" gap="none">
+              <s-text alignment="center" tone="caution" appearance="code">{summary.lowStock}</s-text>
+              <s-text alignment="center" tone="subdued">Low stock</s-text>
+            </s-stack>
+          </s-box>
+          <s-box padding="base" borderWidth="base" borderRadius="base" background="subdued">
+            <s-stack direction="block" gap="none">
+              <s-text alignment="center" tone="critical" appearance="code">{summary.outOfStock}</s-text>
+              <s-text alignment="center" tone="subdued">Out of stock</s-text>
+            </s-stack>
+          </s-box>
+        </s-stack>
+
+        {summary.topLow.length > 0 && (
+          <s-stack direction="block" gap="tight">
+            <s-heading>Top products at risk</s-heading>
+            {summary.topLow.map((p) => (
+              <s-stack key={p.id} direction="inline" gap="base" align="center">
+                <s-text>{p.title}</s-text>
+                <s-badge tone={p.inventory <= 0 ? "critical" : "caution"}>{p.inventory} left</s-badge>
+              </s-stack>
+            ))}
+          </s-stack>
         )}
       </s-section>
 
-      <s-section slot="aside" heading="App template specs">
-        <s-paragraph>
-          <s-text>Framework: </s-text>
-          <s-link href="https://reactrouter.com/" target="_blank">
-            React Router
-          </s-link>
-        </s-paragraph>
-        <s-paragraph>
-          <s-text>Interface: </s-text>
-          <s-link
-            href="https://shopify.dev/docs/api/app-home/using-polaris-components"
-            target="_blank"
-          >
-            Polaris web components
-          </s-link>
-        </s-paragraph>
-        <s-paragraph>
-          <s-text>API: </s-text>
-          <s-link
-            href="https://shopify.dev/docs/api/admin-graphql"
-            target="_blank"
-          >
-            GraphQL
-          </s-link>
-        </s-paragraph>
-        <s-paragraph>
-          <s-text>Custom data: </s-text>
-          <s-link
-            href="https://shopify.dev/docs/apps/build/custom-data"
-            target="_blank"
-          >
-            Metafields &amp; metaobjects
-          </s-link>
-        </s-paragraph>
-        <s-paragraph>
-          <s-text>Database: </s-text>
-          <s-link href="https://www.prisma.io/" target="_blank">
-            Prisma
-          </s-link>
-        </s-paragraph>
+      {/* ─── Chat panel (the hero) ─── */}
+      <s-section heading="Ask Reeve">
+        <div ref={scrollRef} style={{ maxHeight: "320px", overflowY: "auto" }}>
+          <s-stack direction="block" gap="base">
+            {messages.map((m) => (
+              <ChatMessage key={m.id} msg={m} />
+            ))}
+            {isThinking && (
+              <s-box padding="base" background="subdued" borderRadius="base">
+                <s-text tone="subdued">Reeve is thinking…</s-text>
+              </s-box>
+            )}
+          </s-stack>
+        </div>
+
+        <s-stack direction="inline" gap="tight" align="end">
+          <s-textarea
+            placeholder="Ask Reeve about your inventory…"
+            value={input}
+            onInput={(e: Event) => setInput((e.target as HTMLTextAreaElement).value)}
+            onKeyDown={onKeyDown}
+            style={{ flexGrow: 1, minHeight: "60px" }}
+          />
+          <s-button onClick={() => send(input)} loading={isThinking}>
+            Send
+          </s-button>
+        </s-stack>
+
+        <s-stack direction="inline" gap="tight" wrap>
+          <s-button variant="tertiary" onClick={() => send("What's running low?")}>What's running low?</s-button>
+          <s-button variant="tertiary" onClick={() => send("Summarize my inventory health")}>Summarize health</s-button>
+          <s-button variant="tertiary" onClick={() => send("Show me my products")}>Show products</s-button>
+        </s-stack>
       </s-section>
 
-      <s-section slot="aside" heading="Next steps">
-        <s-unordered-list>
-          <s-list-item>
-            Build an{" "}
-            <s-link
-              href="https://shopify.dev/docs/apps/getting-started/build-app-example"
-              target="_blank"
-            >
-              example app
-            </s-link>
-          </s-list-item>
-          <s-list-item>
-            Explore Shopify&apos;s API with{" "}
-            <s-link
-              href="https://shopify.dev/docs/apps/tools/graphiql-admin-api"
-              target="_blank"
-            >
-              GraphiQL
-            </s-link>
-          </s-list-item>
-        </s-unordered-list>
+      {/* ─── Recent activity (audit log) ─── */}
+      <s-section heading="Recent activity">
+        <s-stack direction="block" gap="tight">
+          {activities.length === 0 ? (
+            <s-text tone="subdued">No activity yet. Ask Reeve something above.</s-text>
+          ) : (
+            activities.map((a) => (
+              <s-box key={a.id} padding="base" background="subdued" borderRadius="base">
+                <s-stack direction="inline" gap="base" align="center">
+                  <s-badge tone={a.source === "agent" ? "info" : a.source === "user" ? "success" : "neutral"}>
+                    {a.source}
+                  </s-badge>
+                  <s-text>{a.message}</s-text>
+                </s-stack>
+              </s-box>
+            ))
+          )}
+        </s-stack>
       </s-section>
     </s-page>
   );
 }
 
-export const headers: HeadersFunction = (headersArgs) => {
-  return boundary.headers(headersArgs);
-};
+function ChatMessage({ msg }: { msg: Msg }) {
+  const isUser = msg.role === "user";
+  return (
+    <s-box
+      padding="base"
+      borderRadius="base"
+      background={isUser ? "subdued" : "transparent"}
+      borderWidth={isUser ? "none" : "base"}
+    >
+      <s-stack direction="block" gap="tight">
+        <s-text tone="subdued" appearance="code">{isUser ? "You" : "Reeve"}</s-text>
+        <s-text>{msg.content}</s-text>
+        {msg.actions && msg.actions.length > 0 && (
+          <s-stack direction="block" gap="tight">
+            {msg.actions.map((a, i) => (
+              <s-box key={i} padding="tight" borderRadius="base" background="subdued">
+                <s-stack direction="inline" gap="tight" align="center">
+                  <s-badge tone={a.ok ? "success" : "critical"}>{a.ok ? "✓" : "✗"}</s-badge>
+                  <s-text>{a.summary}</s-text>
+                </s-stack>
+              </s-box>
+            ))}
+          </s-stack>
+        )}
+      </s-stack>
+    </s-box>
+  );
+}
+
+export const headers: HeadersFunction = (headersArgs) => boundary.headers(headersArgs);

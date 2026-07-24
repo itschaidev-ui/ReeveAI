@@ -32,3 +32,33 @@ model Session {
   refreshToken        String?
   refreshTokenExpires DateTime?
 }
+
+// ─── Reeve AI models ──────────────────────────────────────────────────────────
+
+/// One message in a conversation between the merchant and the Reeve agent.
+model ChatMessage {
+  id           String   @id @default(cuid())
+  shop         String
+  role         String // user | assistant
+  content      String
+  /// JSON: [{name, args, result, summary}] — the agent's tool calls, for action cards.
+  actionsJson  String?
+  createdAt    DateTime @default(now())
+
+  @@index([shop, createdAt])
+}
+
+/// Immutable audit-trail row. Every agent write appends one with before/after.
+model Activity {
+  id         String   @id @default(cuid())
+  shop       String
+  type       String // inventory_update | availability_update | price_update | agent_message | system
+  severity   String   @default("info") // info | warning | critical | success
+  source     String   @default("agent") // agent | user | system
+  message    String
+  beforeJson String?
+  afterJson  String?
+  createdAt  DateTime @default(now())
+
+  @@index([shop, createdAt])
+}
