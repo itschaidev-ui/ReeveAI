@@ -58,7 +58,7 @@ export async function askLlm(
     return { ...demoPlan(messages[messages.length - 1]?.content ?? ""), provider: "demo" };
   }
 
-  const model = process.env.NVIDIA_MODEL ?? "meta/llama-3.1-70b-instruct";
+  const model = process.env.NVIDIA_MODEL ?? "deepseek-ai/deepseek-v4-flash";
   const systemPrompt = [
     `You are Reeve AI, an inventory operations agent embedded in the Shopify store "${shopDomain}".`,
     "You diagnose inventory issues and act through tools. Every action is audited.",
@@ -76,8 +76,13 @@ export async function askLlm(
       model,
       messages: [{ role: "system", content: systemPrompt }, ...messages],
       temperature: 0.3,
-      max_tokens: 800,
-    });
+      top_p: 0.95,
+      max_tokens: 2048,
+      // DeepSeek reasoning models on NVIDIA accept these chat-template kwargs.
+      ...(process.env.NVIDIA_THINKING === "false"
+        ? {}
+        : { chat_template_kwargs: { thinking: true, reasoning_effort: "medium" } }),
+    } as unknown as OpenAI.Chat.Completions.ChatCompletionCreateParamsNonStreaming);
     const content = completion.choices[0]?.message?.content ?? "";
     return { ...parseLlmJson(content, messages[messages.length - 1]?.content ?? ""), provider: "nvidia" };
   } catch (e) {
