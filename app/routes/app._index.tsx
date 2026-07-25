@@ -505,7 +505,6 @@ function ReasoningChip({ reasoning, elapsedMs }: { reasoning: string; elapsedMs?
         onMouseEnter={(e) => (e.currentTarget.style.color = C.textPrimary)}
         onMouseLeave={(e) => (e.currentTarget.style.color = C.textMuted)}
       >
-        <BrainIcon size={16} />
         <span>{title}</span>
         <ChevronDownIcon size={14} open={open} />
       </button>
@@ -600,17 +599,6 @@ function parseReasoningSteps(reasoning: string): { label: string; detail: string
     steps.push({ label: "", detail: line });
   }
   return steps;
-}
-
-/** Inline Brain icon (avoids adding lucide-react as a dependency). */
-function BrainIcon({ size = 16 }: { size?: number }) {
-  return (
-    <svg width={size} height={size} viewBox="0 0 24 24" fill="none" stroke="currentColor"
-      strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden style={{ display: "block", flexShrink: 0 }}>
-      <path d="M12 5a3 3 0 1 0-5.997.125 4 4 0 0 0-2.526 5.77 4 4 0 0 0 .556 6.588A4 4 0 1 0 12 18Z" />
-      <path d="M12 5a3 3 0 1 1 5.997.125 4 4 0 0 1 2.526 5.77 4 4 0 0 1-.556 6.588A4 4 0 1 1 12 18Z" />
-    </svg>
-  );
 }
 
 /** Inline chevron-down icon with rotation when open (matches lucide-react). */

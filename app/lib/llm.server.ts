@@ -262,17 +262,88 @@ function demoPlan(message: string): Omit<LlmResult, "provider"> {
     };
   }
 
-  if (/\b(mark|set).*out of stock|unavailable\b/.test(m)) {
+  // ── Product status change (the most-requested write). Matches a wide band
+  //    of natural phrasings so the Approve card is actually reachable from
+  //    demo mode. Direction is decided by which keywords the merchant used.
+  //
+  //    DRAFT (unavailable) intent: out of stock, unavailable, discontinue,
+  //      archive, unpublish, hide, draft, inactive, make unavailable.
+  //    ACTIVE (available) intent: active, available, publish, list, reinstate,
+  //      restore, make available, bring back, relist.
+  //
+  //    Order matters: an explicit ACTIVE keyword wins even if "draft" appears
+  //    elsewhere in the sentence (e.g. "make the draft snowboard active").
+  const draftKws = /\b(out of stock|unavailable|discontinue|discontinued|archive|archived|unpublish|unpublished|hide|hidden|draft|inactive|deactivate)\b/;
+  const activeKws = /\b(active|activate|available|publish|published|list|listed|reinstate|restore|bring back|relist|relaunch)\b/;
+  const statusVerbKws = /\b(mark|set|make|put|switch|change|update|turn|go)\b/;
+  const statusTrigger = /\b(active|activate|available|draft|unavailable|out of stock|discontinue|archive|unpublish|hide|inactive|deactivate|publish|reinstate|restore|relist|relaunch)\b/;
+  if (statusTrigger.test(m) && (activeKws.test(m) || draftKws.test(m))) {
+    // Resolve direction: explicit ACTIVE beats DRAFT unless the merchant named
+    // a draft-state product AND used a make-active verb ("make the draft
+    // snowboard active" → ACTIVE; "mark this out of stock" → DRAFT).
+    const wantsActive = activeKws.test(m);
+    const targetStatus = wantsActive ? "ACTIVE" : "DRAFT";
+    // If the merchant named a specific product, search for it so the agent
+    // loop can auto-fill the productId. Otherwise fall back to the low-stock
+    // read (broad "mark all out of stock" style) and let auto-fill target it.
+    const hasSpecific = /\b(snowboard|shirt|shirt|coffee|mug|t-shirt|tshirt|tee|hat|cap|beanie|jacket|bag|book|mug|bottle|sticker|poster|print)\b/.test(m) ||
+      /\b(product|item|variant)\b/.test(m);
+    const reasoningLines = [
+      `Analyze Input - the merchant wants a product status change to ${targetStatus}.`,
+      `Identify Intent - set_product_status (a WRITE tool, disposition: propose). ${hasSpecific ? "A specific product was named, so search for it first." : "No specific product named, so pull the low-stock list as the target candidate."}`,
+      "Determine Response - fetch the target product(s) (read), then propose the status change. The agent loop auto-fills the productId from the read result.",
+      `Plan Tool Calls - get the product (execute) + set_product_status with status ${targetStatus} (propose).`,
+    ];
+    const toolCalls = hasSpecific
+      ? [
+          { name: "get_products", args: {} },
+          { name: "set_product_status", args: { status: targetStatus }, disposition: "propose" as const },
+        ]
+      : [
+          { name: "get_low_stock_products", args: {} },
+          { name: "set_product_status", args: { status: targetStatus }, disposition: "propose" as const },
+        ];
+    return {
+      reasoning: num(reasoningLines),
+      toolCalls,
+    };
+  }
+  // Status-change intent that mentions the verb but our keyword set didn't
+  // catch a direction (e.g. "make X live"). Treat as ACTIVE by default so the
+  // approve flow still surfaces.
+  if (statusVerbKws.test(m) && /\b(live|visible|on|off|sale|selling)\b/.test(m)) {
     return {
       reasoning: num([
-        "Analyze Input - the merchant wants out-of-stock items marked unavailable.",
-        "Identify Intent - change product availability via set_product_status (a WRITE tool, disposition: propose).",
-        "Determine Response - first fetch low/out-of-stock products so we know which to flip; the agent loop will auto-fill the productId from the read result.",
-        "Plan Tool Calls - call get_low_stock_products (execute) + set_product_status with status DRAFT (propose). The agent fills productId from the read.",
+        "Analyze Input - the merchant wants a product visibility/status change.",
+        "Identify Intent - set_product_status (WRITE, propose).",
+        "Determine Response - fetch the product, then propose the change.",
+        "Plan Tool Calls - get_products (execute) + set_product_status ACTIVE (propose).",
       ]),
       toolCalls: [
-        { name: "get_low_stock_products", args: {} },
-        { name: "set_product_status", args: { status: "DRAFT" }, disposition: "propose" },
+        { name: "get_products", args: {} },
+        { name: "set_product_status", args: { status: "ACTIVE" }, disposition: "propose" },
+      ],
+    };
+  }
+  // Price change (WRITE). Catches "change the price to $20", "set X to 9.99",
+  // "make it $15", "raise/lower/drop the price", etc. Extracts a numeric value
+  // so the proposal summary shows the actual target price.
+  const priceMatch = m.match(/\$\s?(\d+(?:\.\d{1,2})?)|to\s+(\d+(?:\.\d{1,2})?)|price.*?(\d+(?:\.\d{1,2})?)|(\d+(?:\.\d{1,2})?)\s*(?:dollars|usd|bucks)/);
+  const priceVerb = /\b(price|priced|cost|costs|charge|charging|mark up|mark down|discount|raise|lower|drop|increase|decrease|change|set|update)\b/;
+  if (priceVerb.test(m) && priceMatch) {
+    const priceStr = (priceMatch.slice(1).find(Boolean) ?? "0").trim();
+    return {
+      reasoning: num([
+        "Analyze Input - the merchant wants to change a product price.",
+        "Identify Intent - update_price (a WRITE tool, disposition: propose).",
+        "Determine Response - fetch the target product (read), then propose the price change. The agent loop auto-fills the variantId from the read result.",
+        `Plan Tool Calls - get_products (execute) + update_price to ${priceStr} (propose).`,
+      ]),
+      toolCalls: [
+        { name: "get_products", args: {} },
+        // variantId is intentionally omitted — resolveWriteArgs fills it from
+        // the get_products result above. price must be a string per the schema.
+        { name: "update_price", args: { price: priceStr }, disposition: "propose" },
       ],
     };
   }
