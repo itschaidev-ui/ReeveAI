@@ -82,16 +82,26 @@ export async function askLlm(
   const model = process.env.NVIDIA_MODEL ?? "deepseek-ai/deepseek-v4-flash";
   const systemPrompt = [
     `You are Reeve AI, an inventory operations agent embedded in the Shopify store "${shopDomain}".`,
-    "You diagnose inventory issues and act through tools. Every action is audited.",
+    "You diagnose inventory issues AND you act on them. You have READ tools and WRITE tools. Use them.",
+    "Every action is audited.",
     "",
     "Available tools:",
     JSON.stringify(toolCatalog, null, 2),
     "",
-    "Tools are split into two kinds:",
-    "- READ tools (get_products, get_low_stock_products, get_locations, summarize_inventory). You may call these any time. They run immediately and just inform the merchant.",
-    "- WRITE tools (update_inventory, set_product_status, update_price). These mutate the merchant Shopify store. You PROPOSE them but DO NOT execute them yourself -- the merchant will see an Approve card and must click Approve before the write actually runs.",
-    "- For each write tool you emit, set \"disposition\":\"propose\" on the toolCalls entry. For read tools, set \"disposition\":\"execute\" (or omit it).",
-    "- You can only call a write tool if you already know the required ids (productId, variantId, locationId) from current chat history or from a tool call earlier in this same turn. If you do not have the ids, FIRST call the appropriate read tool to get them, then tell the merchant you will propose the write once they ask again.",
+    "CRITICAL — DO NOT REFUSE by claiming you lack capabilities. If a tool is in the catalog above, you HAVE that capability. Specifically:",
+    "- You CAN change product availability via set_product_status (set status to DRAFT to make a product unavailable).",
+    "- You CAN change a price via update_price.",
+    "- You CAN restock via update_inventory (needs a locationId from get_locations).",
+    "- Never write text like 'I can only read' or 'I do not have tools to change X' — those are FALSE. The tools are in your catalog.",
+    "",
+    "Two dispositions for toolCalls:",
+    '- "execute" — for READ tools (get_products, get_low_stock_products, get_locations, summarize_inventory). These run immediately.',
+    '- "propose" — for WRITE tools (set_product_status, update_inventory, update_price). You MUST emit these with disposition:"propose" when the merchant asks for that change. They will NOT run automatically — the merchant sees an Approve card and clicks Approve. Proposing a write IS your job; you do not need permission to propose, you only need it to execute.',
+    "",
+    "Required ids:",
+    "- Write tools need ids (productId, variantId, locationId) you learned from a prior READ tool call (in this turn or earlier in chat history).",
+    "- If the merchant asks for a write and you do NOT yet have the required ids, FIRST emit the matching read tool (disposition:execute) to fetch them. Then, in the SAME toolCalls batch, also emit the write tool (disposition:propose) using the ids you expect to find — the agent loop auto-fills single-row results into the next call's missing ids.",
+    "- Only say 'I will need you to ask again' if you genuinely cannot get the ids from any available read tool.",
     "",
     "Respond with STRICT JSON only, of the shape:",
     '{"reasoning":"<numbered reasoning steps>","toolCalls":[{"name":"<tool>","args":{...},"disposition":"execute|propose"}]}',
@@ -156,6 +166,7 @@ export async function askLlmAnswer(
     "- Do NOT include the action-card summaries (the UI renders those separately). Just the answer prose.",
     "- Plain text only. No markdown, no emoji, no JSON.",
     '- If the user asked for something outside your tool scope (e.g. physically shipping items, billing, marketing, refunds), say so honestly and guide them to the right place in Shopify admin (e.g. Settings > Billing, Orders > Refunds, etc). Never silently fail — escalate.',
+    '- BUT: never claim you lack a capability that is in your tool catalog (set_product_status, update_price, update_inventory). When the merchant asks for a product status change, price change, or inventory restock, your answer should describe the proposed action or its result, not refuse. If no proposed-write card was generated this turn, tell the merchant to ask again with a specific product so you can propose the write.',
     "",
     "Plan reasoning (your own thinking step):",
     reasoning || "(none)",
@@ -252,12 +263,15 @@ function demoPlan(message: string): Omit<LlmResult, "provider"> {
   if (/\b(mark|set).*out of stock|unavailable\b/.test(m)) {
     return {
       reasoning: num([
-        "Analyze Input — the merchant wants out-of-stock items marked unavailable.",
-        "Identify Intent — change product availability on Shopify.",
-        "Determine Response — fetch low + out-of-stock products, then flip them to DRAFT.",
-        "Plan Tool Calls — call get_low_stock_products to find the affected SKUs.",
+        "Analyze Input - the merchant wants out-of-stock items marked unavailable.",
+        "Identify Intent - change product availability via set_product_status.",
+        "Determine Response - first fetch low/out-of-stock products so we know which to flip; propose the DRAFT change for the first result.",
+        "Plan Tool Calls - call get_low_stock_products (execute) + propose set_product_status for the first returned id.",
       ]),
-      toolCalls: [{ name: "get_low_stock_products", args: {} }],
+      toolCalls: [
+        { name: "get_low_stock_products", args: {} },
+        { name: "set_product_status", args: { status: "DRAFT" }, disposition: "propose" },
+      ],
     };
   }
   if (/\b(restock|reorder|replenish)\b/.test(m)) {
