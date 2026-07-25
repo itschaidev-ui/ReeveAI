@@ -176,21 +176,23 @@ export async function dispatch(
       // ── update_inventory (write — gated) ──────────────────────────────────────
       case "update_inventory": {
         const a = schemas.update_inventory.parse(args);
-        interface InvData { inventoryAdjustQuantities: { inventoryLevel: { available: number }; userErrors: unknown[] } }
         // Need the inventory item id for the variant — fetch it first.
-        interface VarData { productVariant: { inventoryItem: { id: string } } }
         const varRes = await gql<{ productVariant: { inventoryItem?: { id: string } } }>(ctx.admin, `#graphql
           query VariantItem($id: ID!) { productVariant(id: $id) { inventoryItem { id } } }`, { id: a.variantId });
         const itemId = varRes.productVariant?.inventoryItem?.id;
         if (!itemId) throw new Error("Variant does not track inventory");
+        // API 2026-10: inventorySetOnHandQuantities takes
+        // InventorySetOnHandQuantitiesInput! (NOT InventorySetQuantitiesInput!,
+        // which doesn't exist and triggers a type-mismatch error).
+        interface InvData { inventorySetOnHandQuantities: { inventoryLevel: { available: number }; userErrors: { field: string; message: string }[] } }
         const data = await gql<InvData>(ctx.admin, `#graphql
-          mutation SetInventory($input: InventorySetQuantitiesInput!) {
+          mutation SetInventory($input: InventorySetOnHandQuantitiesInput!) {
             inventorySetOnHandQuantities(input: $input) {
               inventoryLevel { available }
               userErrors { field message }
             }
           }`, { input: { reason: "correction", setQuantities: [{ inventoryItemId: itemId, locationId: a.locationId, quantity: a.available }] } });
-        const result = (data as unknown as { inventorySetOnHandQuantities: { inventoryLevel: { available: number }; userErrors: { message: string }[] } }).inventorySetOnHandQuantities;
+        const result = data.inventorySetOnHandQuantities;
         if (result.userErrors?.length) throw new Error(result.userErrors.map((e) => e.message).join(", "));
         await logActivity({ shop: ctx.shop, type: "inventory_update", severity: "success", message: `Set inventory to ${a.available} for variant ${a.variantId}`, after: { available: result.inventoryLevel.available } });
         return ok(name, args, { available: result.inventoryLevel.available }, `Set inventory to ${a.available}`);
@@ -200,10 +202,14 @@ export async function dispatch(
       case "set_product_status": {
         const a = schemas.set_product_status.parse(args);
         interface StatusData { productUpdate: { product: { id: string; status: string }; userErrors: { message: string }[] } }
+        // API 2026-10: use the modern `product:` argument with ProductUpdateInput!.
+        // The old `input:` argument expects the deprecated ProductInput type, so
+        // declaring $input: ProductUpdateInput! + passing input: $input throws
+        // "Type mismatch on variable $input and argument input (ProductUpdateInput! / ProductInput)".
         const data = await gql<StatusData>(ctx.admin, `#graphql
-          mutation UpdateStatus($input: ProductUpdateInput!) {
-            productUpdate(input: $input) { product { id status } userErrors { message } }
-          }`, { input: { id: a.productId, status: a.status } });
+          mutation UpdateStatus($product: ProductUpdateInput!) {
+            productUpdate(product: $product) { product { id status } userErrors { message } }
+          }`, { product: { id: a.productId, status: a.status } });
         if (data.productUpdate.userErrors?.length) throw new Error(data.productUpdate.userErrors.map((e) => e.message).join(", "));
         await logActivity({ shop: ctx.shop, type: "availability_update", severity: "success", message: `Set product ${a.productId} status to ${a.status}`, after: { status: a.status } });
         return ok(name, args, { status: a.status }, `Set product status to ${a.status}`);
@@ -212,12 +218,23 @@ export async function dispatch(
       // ── update_price ──────────────────────────────────────────────────────────
       case "update_price": {
         const a = schemas.update_price.parse(args);
-        interface PriceData { productVariantUpdate: { productVariant: { id: string; price: string }; userErrors: { message: string }[] } }
-        const data = await gql<PriceData>(ctx.admin, `#graphql
-          mutation UpdatePrice($input: ProductVariantInput!) {
-            productVariantUpdate(input: $input) { productVariant { id price } userErrors { message } }
-          }`, { input: { id: a.variantId, price: a.price } });
-        if (data.productVariantUpdate.userErrors?.length) throw new Error(data.productVariantUpdate.userErrors.map((e) => e.message).join(", "));
+        // API 2026-10: productVariantUpdate is DEPRECATED (since 2024-10). The
+        // modern mutation is productVariantsBulkUpdate, which needs the parent
+        // productId plus a variants[] array. Fetch the productId first.
+        const varRes = await gql<{ productVariant: { product?: { id: string } } }>(ctx.admin, `#graphql
+          query VariantParent($id: ID!) { productVariant(id: $id) { product { id } } }`, { id: a.variantId });
+        const parentId = varRes.productVariant?.product?.id;
+        if (!parentId) throw new Error("Could not resolve parent product for variant");
+        interface BulkData { productVariantsBulkUpdate: { productVariants: { id: string; price: string }[]; userErrors: { field: string[]; message: string }[] } }
+        const data = await gql<BulkData>(ctx.admin, `#graphql
+          mutation UpdatePrice($productId: ID!, $variants: [ProductVariantsBulkInput!]!) {
+            productVariantsBulkUpdate(productId: $productId, variants: $variants) {
+              productVariants { id price }
+              userErrors { field message }
+            }
+          }`, { productId: parentId, variants: [{ id: a.variantId, price: a.price }] });
+        const result = data.productVariantsBulkUpdate;
+        if (result.userErrors?.length) throw new Error(result.userErrors.map((e) => e.message).join(", "));
         await logActivity({ shop: ctx.shop, type: "price_update", severity: "info", message: `Set price to $${a.price} for variant ${a.variantId}`, after: { price: a.price } });
         return ok(name, args, { price: a.price }, `Set price to $${a.price}`);
       }
