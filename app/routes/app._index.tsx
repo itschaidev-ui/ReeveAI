@@ -33,6 +33,13 @@ const C = {
 
 const CONTENT_MAX = 720; // px — Gemini's content width feel
 
+// Approval-word detection. When the user replies to a pending-write turn with
+// one of these, we intercept the input and route it to /app/chat/approve
+// instead of /app/chat. Lets merchants type "yes" instead of hunting for the
+// Approve button.
+const APPROVAL_YES = /^\s*(yes|y|yep|yeah|ok|okay|sure|approve|approved|confirm|confirmed|do it|go ahead|go for it|please do|do that)\s*[!.]?\s*$/i;
+const APPROVAL_NO = /^\s*(no|n|nope|cancel|cancelled|cancel it|dont|do not|stop|abort)\s*[!.]?\s*$/i;
+
 // ─── Loader (unchanged) ──────────────────────────────────────────────────────
 
 interface InventorySummary { total: number; inStock: number; lowStock: number; outOfStock: number; topLow: { id: string; title: string; inventory: number }[] }
@@ -200,6 +207,36 @@ export default function ReeveChat() {
   const send = (text: string) => {
     const trimmed = text.trim();
     if (!trimmed || isThinking) return;
+
+    // Approval intercept: if the user typed a yes-word and the latest assistant
+    // message has pending writes, route the input to /app/chat/approve for each
+    // pending write instead of /app/chat. This handles the natural "Yes" reply
+    // to "Do you approve this change?" without requiring the merchant to find
+    // the Approve button.
+    const latestAssistant = [...messages].reverse().find((m) => m.role === "assistant");
+    const pendingOnLatest = latestAssistant?.pendingWrites?.filter((p) => p && p.nonce) ?? [];
+    if (pendingOnLatest.length > 0) {
+      if (APPROVAL_YES.test(trimmed.toLowerCase())) {
+        setMessages((m) => [...m, { id: `u-${Date.now()}`, role: "user", content: trimmed }]);
+        setInput("");
+        for (const pw of pendingOnLatest) {
+          window.dispatchEvent(new CustomEvent("reeve:approve", {
+            detail: { messageId: latestAssistant!.id, nonce: pw.nonce, tool: pw.tool, args: pw.args },
+          }));
+        }
+        return;
+      }
+      if (APPROVAL_NO.test(trimmed.toLowerCase())) {
+        setMessages((m) => [...m, { id: `u-${Date.now()}`, role: "user", content: trimmed }]);
+        setInput("");
+        setMessages((ms) => ms.map((m) =>
+          m.id === latestAssistant!.id ? { ...m, pendingWrites: [] } : m,
+        ));
+        shopify.toast.show("Cancelled pending write(s)");
+        return;
+      }
+    }
+
     setMessages((m) => [...m, { id: `u-${Date.now()}`, role: "user", content: trimmed }]);
     setInput("");
     lastReplyRef.current = null;

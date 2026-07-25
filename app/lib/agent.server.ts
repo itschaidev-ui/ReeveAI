@@ -159,9 +159,18 @@ export async function runAgent(params: {
   const pendingSummary = pendingWrites.length
     ? `\n\n[PROPOSED WRITES — awaiting merchant approval]: ${pendingWrites.map((p) => p.summary).join("; ")}`
     : "";
+  // Explicit gate status for the answer LLM. Without this, the model has been
+  // observed hallucinating "X has been set to ACTIVE" even though no write
+  // actually executed this turn (writes only run after the merchant clicks
+  // Approve on the next turn). This block makes the state unambiguous.
+  const writeGateSummary = pendingWrites.length
+    ? `\n\n[WRITE GATE STATUS — READ CAREFULLY]: ${pendingWrites.length} write(s) PROPOSED but NONE EXECUTED. The merchant has NOT approved them yet. They will run on the NEXT turn only if the merchant says yes or clicks Approve. Do NOT describe any write as completed/done/applied/successful this turn — use "I have proposed X, awaiting your approval".`
+    : (actions.some((a) => isWriteTool(a.name))
+      ? `\n\n[WRITE GATE STATUS]: No writes were proposed or executed this turn.`
+      : "");
   const answerResult = await askLlmAnswer(
     [...history, { role: "user", content: message }],
-    message + pendingSummary,
+    message + pendingSummary + writeGateSummary,
     reasoning,
     toolResultSummary,
     shop,
