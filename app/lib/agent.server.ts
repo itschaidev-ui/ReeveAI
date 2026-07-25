@@ -63,10 +63,39 @@ export async function runAgent(params: {
   const history: LlmMessage[] = recent
     .reverse()
     .filter((m) => m.role === "user" || m.role === "assistant")
-    .map((m) => ({
-      role: (m.role === "user" ? "user" : "assistant") as "user" | "assistant",
-      content: m.content,
-    }));
+    .map((m) => {
+      if (m.role !== "assistant") {
+        return { role: "user" as const, content: m.content };
+      }
+      // For assistant turns, append a compact machine-readable block of the
+      // tool action results (product/variant/location ids) so the model can
+      // reference them in follow-up write proposals on later turns. Without
+      // this, the model has no way to know which productId to propose.
+      let content = m.content;
+      if (m.actionsJson) {
+        try {
+          const acts = JSON.parse(m.actionsJson) as Array<{
+            name: string; ok: boolean; result?: unknown; summary?: string;
+          }>;
+          const ids: string[] = [];
+          for (const a of acts) {
+            if (!a.ok || !Array.isArray(a.result)) continue;
+            for (const row of a.result as Array<Record<string, unknown>>) {
+              if (typeof row.id === "string") ids.push(`${a.name}:${row.id}:${typeof row.title === "string" ? row.title : ""}`);
+              if (Array.isArray(row.variants)) {
+                for (const v of row.variants as Array<Record<string, unknown>>) {
+                  if (typeof v.id === "string") ids.push(`variant:${v.id}`);
+                }
+              }
+            }
+          }
+          if (ids.length) {
+            content += `\n[VISIBLE TOOL RESULT IDS — use these to target writes]:\n${ids.slice(0, 40).join("\n")}`;
+          }
+        } catch { /* malformed actionsJson — skip */ }
+      }
+      return { role: "assistant" as const, content };
+    });
 
   // 2. Ask the LLM to plan.
   const plan = await askLlm(
@@ -90,11 +119,19 @@ export async function runAgent(params: {
     }
     const wantsPropose = call.disposition === "propose" || isWriteTool(call.name);
     if (wantsPropose) {
+      // Auto-resolve missing target ids from this turn's already-executed read
+      // results. Lets the model propose a write against "the first low-stock
+      // product" without needing a re-plan loop.
+      const resolved = resolveWriteArgs(call.name, call.args, actions);
       pendingWrites.push({
         nonce: `pw-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
         tool: call.name,
-        args: call.args,
-        summary: describeWriteCall(call.name, call.args),
+        args: resolved.args,
+        // If we filled missing ids, surface that in the summary so the merchant
+        // can see WHICH product the write targets (not a blank id-tail).
+        summary: resolved.filledFromRead
+          ? describeWriteCall(call.name, resolved.args) + ` (from "${resolved.filledFromRead}")`
+          : describeWriteCall(call.name, resolved.args),
       });
       continue;
     }
@@ -155,4 +192,47 @@ export async function runAgent(params: {
   });
 
   return { reasoning, response, actions, pendingWrites, provider: answerResult.provider, elapsedMs };
+}
+
+/**
+ * If a proposed write is missing its target id(s), try to fill them from this
+ * turn's already-executed READ action results. Returns the (possibly modified)
+ * args plus a hint about which read row we sourced them from, so the summary
+ * card can show the merchant what was matched.
+ *
+ * This is the band-aid for the missing re-plan loop: without it, the model
+ * cannot propose a write for "the first low-stock product" because at plan
+ * time it has not seen the read result yet.
+ */
+function resolveWriteArgs(
+  toolName: string,
+  args: Record<string, unknown>,
+  actions: ToolResult[],
+): { args: Record<string, unknown>; filledFromRead?: string } {
+  const out = { ...args };
+  let filledFromRead: string | undefined;
+
+  // Find the first read action that returned a non-empty product/variant list.
+  const readWithRows = actions.find(
+    (a) => a.ok && Array.isArray(a.result) && (a.result as unknown[]).length > 0,
+  );
+  if (!readWithRows) return { args: out };
+
+  const rows = readWithRows.result as Array<Record<string, unknown>>;
+  const firstRow = rows[0];
+  const firstTitle = typeof firstRow.title === "string" ? firstRow.title : readWithRows.name;
+  filledFromRead = firstTitle;
+
+  if (toolName === "set_product_status" && !out.productId && typeof firstRow.id === "string") {
+    out.productId = firstRow.id;
+  }
+  if ((toolName === "update_price" || toolName === "update_inventory") && !out.variantId) {
+    // Prefer a variant id on the first row; fall back to the row's own id.
+    const variants = Array.isArray(firstRow.variants) ? (firstRow.variants as Array<Record<string, unknown>>) : [];
+    const firstVariant = variants[0];
+    if (firstVariant && typeof firstVariant.id === "string") out.variantId = firstVariant.id;
+    else if (typeof firstRow.id === "string") out.variantId = firstRow.id;
+  }
+
+  return { args: out, filledFromRead };
 }

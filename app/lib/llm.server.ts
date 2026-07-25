@@ -167,6 +167,7 @@ export async function askLlmAnswer(
     "- Plain text only. No markdown, no emoji, no JSON.",
     '- If the user asked for something outside your tool scope (e.g. physically shipping items, billing, marketing, refunds), say so honestly and guide them to the right place in Shopify admin (e.g. Settings > Billing, Orders > Refunds, etc). Never silently fail — escalate.',
     '- BUT: never claim you lack a capability that is in your tool catalog (set_product_status, update_price, update_inventory). When the merchant asks for a product status change, price change, or inventory restock, your answer should describe the proposed action or its result, not refuse. If no proposed-write card was generated this turn, tell the merchant to ask again with a specific product so you can propose the write.',
+    "- PENDING WRITES DID NOT HAPPEN YET. If the input mentions '[PROPOSED WRITES — awaiting merchant approval]', those writes have NOT run. Phrase them in future tense or as proposals: 'I have proposed marking <product> as DRAFT — approve below to apply it.' Never say 'I marked', 'I updated', or 'I changed' for a pending write. Only use past tense for actions whose results are listed in the tool execution results section.",
     "",
     "Plan reasoning (your own thinking step):",
     reasoning || "(none)",
@@ -264,9 +265,9 @@ function demoPlan(message: string): Omit<LlmResult, "provider"> {
     return {
       reasoning: num([
         "Analyze Input - the merchant wants out-of-stock items marked unavailable.",
-        "Identify Intent - change product availability via set_product_status.",
-        "Determine Response - first fetch low/out-of-stock products so we know which to flip; propose the DRAFT change for the first result.",
-        "Plan Tool Calls - call get_low_stock_products (execute) + propose set_product_status for the first returned id.",
+        "Identify Intent - change product availability via set_product_status (a WRITE tool, disposition: propose).",
+        "Determine Response - first fetch low/out-of-stock products so we know which to flip; the agent loop will auto-fill the productId from the read result.",
+        "Plan Tool Calls - call get_low_stock_products (execute) + set_product_status with status DRAFT (propose). The agent fills productId from the read.",
       ]),
       toolCalls: [
         { name: "get_low_stock_products", args: {} },
