@@ -84,7 +84,14 @@ export async function askLlm(
     JSON.stringify(toolCatalog, null, 2),
     "",
     "Respond with STRICT JSON only, of the shape:",
-    '{"reasoning":"<one short paragraph — what you noticed and what you plan to do>","toolCalls":[{"name":"<tool>","args":{...}}]}',
+    '{"reasoning":"<numbered reasoning steps, one per line>","toolCalls":[{"name":"<tool>","args":{...}}]}',
+    "",
+    "Reasoning format:",
+    '- "reasoning" is a multi-line string where each line is one numbered step of your thought process,',
+    '- Each line starts with "N. <Step Name> — <short explanation>" (e.g. "1. Analyze Input — parsing the merchant question").',
+    "- Include the steps: Analyze Input, Identify Intent, Determine Response, Plan Tool Calls (if any).",
+    "- Typically 2-5 steps. Be terse — one short clause per step.",
+    "",
     "Do not wrap the JSON in markdown fences. Pick only from the listed tools.",
     "If no tool is needed (e.g. the user is just asking a conceptual question), use an empty toolCalls array and explain in reasoning.",
   ].join("\n");
@@ -202,28 +209,49 @@ function parseLlmJson(content: string, userMessage: string): Omit<LlmResult, "pr
 
 function demoPlan(message: string): Omit<LlmResult, "provider"> {
   const m = message.toLowerCase();
+  const num = (lines: string[]) => lines.map((l, i) => `${i + 1}. ${l}`).join("\n");
 
   if (/\b(mark|set).*out of stock|unavailable\b/.test(m)) {
     return {
-      reasoning: "I'll find the low and out-of-stock products so we can act on them.",
+      reasoning: num([
+        "Analyze Input — the merchant wants out-of-stock items marked unavailable.",
+        "Identify Intent — change product availability on Shopify.",
+        "Determine Response — fetch low + out-of-stock products, then flip them to DRAFT.",
+        "Plan Tool Calls — call get_low_stock_products to find the affected SKUs.",
+      ]),
       toolCalls: [{ name: "get_low_stock_products", args: {} }],
     };
   }
   if (/\b(restock|reorder|replenish)\b/.test(m)) {
     return {
-      reasoning: "Let me pull the low-stock list so we can plan a restock.",
+      reasoning: num([
+        "Analyze Input — the merchant wants to plan a restock.",
+        "Identify Intent — surface what needs reordering.",
+        "Determine Response — pull the current low-stock list.",
+        "Plan Tool Calls — call get_low_stock_products to find the candidates.",
+      ]),
       toolCalls: [{ name: "get_low_stock_products", args: {} }],
     };
   }
   if (/\b(summary|summarize|overview|health|status|report)\b/.test(m)) {
     return {
-      reasoning: "Here's a quick health snapshot of your inventory.",
+      reasoning: num([
+        "Analyze Input — the merchant wants an overall inventory health report.",
+        "Identify Intent — summarize stock counts across the store.",
+        "Determine Response — compute totals: in-stock, low, out-of-stock.",
+        "Plan Tool Calls — call summarize_inventory.",
+      ]),
       toolCalls: [{ name: "summarize_inventory", args: {} }],
     };
   }
   // default: what's running low
   return {
-    reasoning: "Let me check what's running low so you can act on it.",
+    reasoning: num([
+      "Analyze Input — the merchant is asking about inventory state.",
+      "Identify Intent — surface what is running low.",
+      "Determine Response — fetch products at or below the low-stock threshold.",
+      "Plan Tool Calls — call get_low_stock_products.",
+    ]),
     toolCalls: [{ name: "get_low_stock_products", args: {} }],
   };
 }

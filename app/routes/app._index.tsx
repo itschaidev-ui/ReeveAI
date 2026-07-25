@@ -335,11 +335,13 @@ function MessageRow({ msg }: { msg: Message }) {
   );
 }
 
-/** Collapsible "Thought for Ns" chip — ChatGPT/Claude pattern. */
+/** Collapsible "Thought for Ns" chip — exposes the agent's reasoning as
+ *  numbered, monospaced steps in a light-grey panel (Gemini-style). */
 function ReasoningChip({ reasoning, elapsedMs }: { reasoning: string; elapsedMs?: number | null }) {
   const [open, setOpen] = useState(false);
   const seconds = elapsedMs != null ? Math.max(1, Math.round(elapsedMs / 1000)) : null;
   const label = seconds != null ? `Thought for ${seconds}s` : "Reasoning";
+  const steps = parseReasoningSteps(reasoning);
   return (
     <div style={{ marginBottom: "10px" }}>
       <button
@@ -355,18 +357,53 @@ function ReasoningChip({ reasoning, elapsedMs }: { reasoning: string; elapsedMs?
         <span>{label}</span>
       </button>
       {open && (
-        <div style={{
-          marginTop: "8px", padding: "12px 14px",
-          background: C.surface2, border: `1px solid ${C.border}`, borderRadius: "10px",
-          fontSize: "13px", lineHeight: 1.65, color: C.textMuted, fontStyle: "italic",
-          whiteSpace: "pre-wrap", wordBreak: "break-word",
-          boxShadow: "inset 0 0 0 0 transparent",
-        }}>
-          {reasoning}
+        <div
+          role="region"
+          style={{
+            marginTop: "8px", padding: "14px 16px",
+            background: C.surface2, border: `1px solid ${C.border}`, borderRadius: "10px",
+            boxShadow: "0 1px 3px rgba(60,64,67,0.06)",
+          }}
+        >
+          {steps.length > 0 ? (
+            <ol style={{ listStyle: "none", margin: 0, padding: 0, display: "flex", flexDirection: "column", gap: "8px" }}>
+              {steps.map((s, i) => (
+                <li key={i} style={{
+                  display: "flex", gap: "10px", alignItems: "baseline",
+                  fontFamily: 'ui-monospace, "SF Mono", Menlo, Monaco, "Cascadia Code", monospace',
+                  fontSize: "12.5px", lineHeight: 1.55, color: C.textPrimary,
+                }}>
+                  <span style={{ color: C.textMuted, flexShrink: 0, minWidth: "18px", textAlign: "right" }}>{s.n}.</span>
+                  <span style={{ whiteSpace: "pre-wrap", wordBreak: "break-word" }}>{s.text}</span>
+                </li>
+              ))}
+            </ol>
+          ) : (
+            <pre style={{
+              margin: 0, whiteSpace: "pre-wrap", wordBreak: "break-word",
+              fontFamily: 'ui-monospace, "SF Mono", Menlo, Monaco, "Cascadia Code", monospace',
+              fontSize: "12.5px", lineHeight: 1.55, color: C.textMuted,
+            }}>{reasoning}</pre>
+          )}
         </div>
       )}
     </div>
   );
+}
+
+/** Parse a reasoning string (assumed ". numbered, one step per line") into steps.
+ *  Tolerates plain prose/legacy formats by returning []. */
+function parseReasoningSteps(reasoning: string): { n: string; text: string }[] {
+  const lines = reasoning.split(/\r?\n/).map((l) => l.trim()).filter(Boolean);
+  if (!lines.length) return [];
+  // Each step should look like "1. Analyze Input — parsing the user greeting"
+  const steps: { n: string; text: string }[] = [];
+  for (const line of lines) {
+    const m = line.match(/^(\d{1,2})\.?\s+(.+)$/);
+    if (m) steps.push({ n: m[1], text: m[2].trim() });
+  }
+  // If none of the lines look numbered, fall back to [] so the caller renders raw.
+  return steps;
 }
 
 function ActionCard({ action: a }: { action: ChatAction }) {
