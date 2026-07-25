@@ -71,7 +71,6 @@ model ChatMessage {
   @@index([shop, createdAt])
   @@index([conversationId, createdAt])
 }
-}
 
 /// Immutable audit-trail row. Every agent write appends one with before/after.
 model Activity {
