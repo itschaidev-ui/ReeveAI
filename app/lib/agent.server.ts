@@ -11,21 +11,33 @@
 
 import prisma from "../db.server";
 import { askLlm, askLlmAnswer, type LlmMessage, type ReasoningEffort } from "./llm.server";
-import { dispatch, toolCatalog, type ToolCtx, type ToolName, type ToolResult } from "./agent-tools.server";
+import { dispatch, describeWriteCall, toolCatalog, isWriteTool, type ToolCtx, type ToolName, type ToolResult } from "./agent-tools.server";
 import { logActivity } from "./audit.server";
 
 interface AdminClient {
   graphql: (query: string, options?: { variables?: Record<string, unknown> }) => Promise<Response>;
 }
 
+export interface PendingWrite {
+  /** Stable id for the client to track this proposal through approve/cancel. */
+  nonce: string;
+  tool: string;
+  args: Record<string, unknown>;
+  /** One-line human-readable description of what approving will do. */
+  summary: string;
+}
+
 export interface AgentResponse {
   /** Step-1 (planning) reasoning shown in the collapsible "Thinking" chip. */
   reasoning: string;
-  /** Step-2 (final answer) prose the merchant reads as the message body. Built
-   *  from the tool RESULTS, not the planning reasoning -- so it actually reflects
-   *  what happened when the tools ran. */
+  /** Step-2 (final answer) prose the merchant reads as the message body. */
   response: string;
   actions: ToolResult[];
+  /** WRITE tools the model proposed but did not execute. The client renders
+   *  Approve cards for these; the actual mutation only fires when the merchant
+   *  clicks Approve (separate POST to /app/chat/approve). READ tools are NOT
+   *  in here -- those ran immediately and their results are in actions. */
+  pendingWrites: PendingWrite[];
   provider: "nvidia" | "demo";
   /** Wall-clock ms the agent took (planning + tools + final-answer generation). */
   elapsedMs: number;
@@ -64,36 +76,55 @@ export async function runAgent(params: {
     effort,
   );
 
-  // 3. Execute each tool call in order.
+  // 3. Split the plan into reads (execute immediately) and writes (collect as
+  //    pending approvals -- never execute automatically). Either signal is
+  //    enough: the model can declare disposition="propose" OR we fall back to
+  //    isWriteTool(name) for safety in case the model forgets the field.
+  const known = toolCatalog.reduce((a, t) => ({ ...a, [t.name]: true }), {} as Record<string, boolean>);
   const actions: ToolResult[] = [];
+  const pendingWrites: PendingWrite[] = [];
   for (const call of plan.toolCalls) {
-    if (!(call.name in toolCatalog.reduce((a, t) => ({ ...a, [t.name]: true }), {} as Record<string, boolean>))) {
+    if (!(call.name in known)) {
       actions.push({ name: call.name, args: call.args, result: null, summary: `Unknown tool: ${call.name}`, ok: false, error: "unknown tool" });
       continue;
     }
+    const wantsPropose = call.disposition === "propose" || isWriteTool(call.name);
+    if (wantsPropose) {
+      pendingWrites.push({
+        nonce: `pw-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+        tool: call.name,
+        args: call.args,
+        summary: describeWriteCall(call.name, call.args),
+      });
+      continue;
+    }
+
     const result = await dispatch(call.name as ToolName, call.args, ctx);
     actions.push(result);
 
     // Chain: if a query returned exactly one product/variant, fill the next
-    // write call's missing ids from it (simple planning aid for demo mode).
+    // READ call's missing ids from it (simple planning aid for demo mode).
     const next = plan.toolCalls[plan.toolCalls.indexOf(call) + 1];
-    if (next && result.ok && Array.isArray(result.result) && result.result.length === 1) {
+    if (next && !isWriteTool(next.name) && result.ok && Array.isArray(result.result) && result.result.length === 1) {
       const row = result.result[0] as Record<string, unknown>;
       if (next.args.variantId === undefined && row.variantId) next.args.variantId = row.variantId;
       if (next.args.productId === undefined && row.id) next.args.productId = row.id as string;
     }
   }
 
-  // 4. Step 2: ask the LLM for the FINAL answer, fed the tool RESULTS.
-  //    Body is no longer the planning reasoning glued to a summary — it is a
-  //    clean, second-LLM-call answer that actually reflects what happened.
+  // 4. Step 2: ask the LLM for the FINAL answer, fed the tool RESULTS (reads)
+  //    AND a note about any pending write proposals so it can phrase the
+  //    answer correctly ("I'm waiting for you to approve the DRAFT change").
   const reasoning = plan.reasoning.trim();
   const toolResultSummary = actions.map((a) => ({
     name: a.name, summary: a.summary, ok: a.ok, error: a.error, result: a.result,
   }));
+  const pendingSummary = pendingWrites.length
+    ? `\n\n[PROPOSED WRITES — awaiting merchant approval]: ${pendingWrites.map((p) => p.summary).join("; ")}`
+    : "";
   const answerResult = await askLlmAnswer(
     [...history, { role: "user", content: message }],
-    message,
+    message + pendingSummary,
     reasoning,
     toolResultSummary,
     shop,
@@ -123,5 +154,5 @@ export async function runAgent(params: {
     message: `Reeve replied: ${response.slice(0, 140)}${response.length > 140 ? "..." : ""}`,
   });
 
-  return { reasoning, response, actions, provider: answerResult.provider, elapsedMs };
+  return { reasoning, response, actions, pendingWrites, provider: answerResult.provider, elapsedMs };
 }

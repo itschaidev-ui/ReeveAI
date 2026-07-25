@@ -34,41 +34,62 @@ export interface ToolCtx {
 export const toolCatalog = [
   {
     name: "get_products",
-    description: "List products in the store with their inventory counts and status. Optional filter by query text.",
+    description: "List products in the store with their inventory counts, status, and variant ids. Optional filter by query text. READ-only — runs immediately.",
     args: { query: "string?", limit: "number?" },
   },
   {
     name: "get_low_stock_products",
-    description: "Return products whose inventory is at or below the given threshold (default 5).",
+    description: "Return products whose inventory is at or below the given threshold (default 5). Each row includes title, status, minInventory, id (product gid), and variants[].id (variant gid). READ-only.",
     args: { threshold: "number?" },
   },
   {
+    name: "get_locations",
+    description: "Return the inventory locations configured on the shop (the place stock is tracked at). Each row includes id (location gid), name, and active flag. You need a locationId to call update_inventory. READ-only — runs immediately.",
+    args: {},
+  },
+  {
     name: "update_inventory",
-    description: "Set a product variant's absolute inventory level at a location. Use after get_products to find the variant id + location id.",
+    description: "Set a product variant's absolute inventory level at a location. WRITE — Reeve will PROPOSE this action; the merchant must approve it before it runs. Needs a variantId (from get_low_stock_products/get_products results) and a locationId (from get_locations).",
     args: { variantId: "string", locationId: "string", available: "number" },
+    disposition: "propose",
   },
   {
     name: "set_product_status",
-    description: "Set a product's status (ACTIVE or DRAFT). Use DRAFT to make a product unavailable/unlisted.",
+    description: "Set a product's status to ACTIVE or DRAFT (DRAFT makes the product unavailable/unlisted). WRITE — Reeve will PROPOSE this; the merchant must approve before it runs. Needs a productId (from get_low_stock_products/get_products results).",
     args: { productId: "string", status: "ACTIVE|DRAFT" },
+    disposition: "propose",
   },
   {
     name: "update_price",
-    description: "Set a product variant's price in dollars (e.g. 49.99).",
+    description: "Set a product variant's price in dollars (e.g. 49.99). WRITE — Reeve will PROPOSE this; the merchant must approve before it runs. Needs a variantId.",
     args: { variantId: "string", price: "string" },
+    disposition: "propose",
   },
   {
     name: "summarize_inventory",
-    description: "Return a synthesized health summary: total products, low-stock count, out-of-stock count.",
+    description: "Return a synthesized health summary: total products, low-stock count, out-of-stock count. READ-only.",
     args: {},
   },
 ];
+
+/** Tools that mutate Shopify state. These are gated behind an Approve card —
+ *  the agent never executes them directly. */
+export const WRITE_TOOLS: Record<string, true> = {
+  update_inventory: true,
+  set_product_status: true,
+  update_price: true,
+};
+
+export function isWriteTool(name: string): boolean {
+  return Object.prototype.hasOwnProperty.call(WRITE_TOOLS, name);
+}
 
 // ─── Zod schemas for arg validation ────────────────────────────────────────────
 
 const schemas = {
   get_products: z.object({ query: z.string().optional(), limit: z.number().int().min(1).max(250).optional() }),
   get_low_stock_products: z.object({ threshold: z.number().int().min(0).optional() }),
+  get_locations: z.object({}).strict(),
   update_inventory: z.object({ variantId: z.string(), locationId: z.string(), available: z.number().int().min(0) }),
   set_product_status: z.object({ productId: z.string(), status: z.enum(["ACTIVE", "DRAFT"]) }),
   update_price: z.object({ variantId: z.string(), price: z.string() }),
@@ -138,7 +159,21 @@ export async function dispatch(
         return ok(name, args, low, `Found ${low.length} product(s) at or below ${threshold} units`);
       }
 
-      // ── update_inventory ──────────────────────────────────────────────────────
+      // ── get_locations (read) ──────────────────────────────────────────────────
+      case "get_locations": {
+        z.object({}).strict().parse(args);
+        interface LocationsData { locations: { edges: Array<{ node: { id: string; name: string; active: boolean } }> } }
+        const data = await gql<LocationsData>(ctx.admin, `#graphql
+          query Locations($first: Int!) {
+            locations(first: $first) { edges { node { id name active } } }
+          }`, { first: 25 });
+        const locations = data.locations.edges.map((e) => ({
+          id: e.node.id, name: e.node.name, active: e.node.active,
+        }));
+        return ok(name, args, locations, `Found ${locations.length} location${locations.length === 1 ? "" : "s"}`);
+      }
+
+      // ── update_inventory (write — gated) ──────────────────────────────────────
       case "update_inventory": {
         const a = schemas.update_inventory.parse(args);
         interface InvData { inventoryAdjustQuantities: { inventoryLevel: { available: number }; userErrors: unknown[] } }
@@ -218,4 +253,27 @@ function ok(name: string, args: Record<string, unknown>, result: unknown, summar
 }
 function fail(name: string, args: Record<string, unknown>, error: string, summary: string): ToolResult {
   return { name, args, result: null, summary, ok: false, error };
+}
+
+/**
+ * One-line human-readable description of what a proposed write would do if
+ * approved. Used by the agent loop to populate pending-write Approve cards.
+ * Falls back to the tool name when args are missing/unknown.
+ */
+export function describeWriteCall(name: string, args: Record<string, unknown>): string {
+  const a = args ?? {};
+  const tail = (gid: unknown) => (typeof gid === "string" ? gid.split("/").pop() ?? gid : gid);
+  switch (name) {
+    case "set_product_status": {
+      const status = String(a.status ?? "?");
+      const verb = status.toUpperCase() === "DRAFT" ? "unavailable (DRAFT)" : status;
+      return `Mark product ${tail(a.productId)} as ${verb}`;
+    }
+    case "update_price":
+      return `Set price of variant ${tail(a.variantId)} to $${a.price ?? "?"}`;
+    case "update_inventory":
+      return `Set inventory of variant ${tail(a.variantId)} to ${a.available ?? "?"} units`;
+    default:
+      return `Run ${name}`;
+  }
 }

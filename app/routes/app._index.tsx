@@ -37,6 +37,13 @@ const CONTENT_MAX = 720; // px — Gemini's content width feel
 
 interface InventorySummary { total: number; inStock: number; lowStock: number; outOfStock: number; topLow: { id: string; title: string; inventory: number }[] }
 interface ChatAction { name: string; summary: string; ok: boolean; error?: string; result?: unknown }
+interface PendingWrite {
+  nonce: string;
+  tool: string;
+  args: Record<string, unknown>;
+  summary: string;
+}
+
 interface Message {
   id: string;
   role: string;
@@ -44,11 +51,12 @@ interface Message {
   actions: ChatAction[] | null;
   reasoning?: string | null; // assistant only; null for user + legacy rows
   elapsedMs?: number | null; // assistant only; null for user + legacy rows
+  pendingWrites?: PendingWrite[]; // assistant only; transient (not persisted yet)
 }
 interface LoaderData { summary: InventorySummary; messages: Message[]; provider: "nvidia" | "demo" }
 
 /** Shape returned by POST /app/chat — used by the optimistic assistant-reply effect. */
-interface ChatResult { response?: string; reasoning?: string | null; actions?: ChatAction[]; elapsedMs?: number | null; error?: string }
+interface ChatResult { response?: string; reasoning?: string | null; actions?: ChatAction[]; elapsedMs?: number | null; pendingWrites?: PendingWrite[]; error?: string }
 
 export const loader = async ({ request }: LoaderFunctionArgs): Promise<LoaderData> => {
   const { admin, session } = await authenticate.admin(request);
@@ -97,6 +105,7 @@ export default function ReeveChat() {
   const { summary, messages: initialMessages, provider } = useLoaderData<typeof loader>();
   const fetcher = useFetcher<typeof loader>();
   const chatFetcher = useFetcher<ChatResult>();
+  const approveFetcher = useFetcher<{ action?: ChatAction; error?: string }>();
   const shopify = useAppBridge();
 
   const [messages, setMessages] = useState<Message[]>(initialMessages);
@@ -131,11 +140,62 @@ export default function ReeveChat() {
     return () => window.removeEventListener("reeve:stub", handler as EventListener);
   }, [shopify]);
 
+  // Bridge from the PendingWriteCard's Approve click to approveFetcher.submit.
+  // We do it via window events so the card stays a self-contained component
+  // and doesn't need approveFetcher props plumbed through.
+  useEffect(() => {
+    const handler = (e: Event) => {
+      const d = (e as CustomEvent<{ messageId: string; nonce: string; tool: string; args: Record<string, unknown> }>).detail;
+      approveFetcherRef.current = { messageId: d.messageId, nonce: d.nonce };
+      approveFetcher.submit(
+        { tool: d.tool, args: d.args },
+        { method: "POST", action: "/app/chat/approve", encType: "application/json" },
+      );
+      // Let the card know its click has been accepted.
+      window.dispatchEvent(new CustomEvent("reeve:approve-resolved", { detail: { nonce: d.nonce } }));
+    };
+    window.addEventListener("reeve:approve", handler as EventListener);
+    return () => window.removeEventListener("reeve:approve", handler as EventListener);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
   useEffect(() => {
     scrollRef.current?.scrollTo({ top: scrollRef.current.scrollHeight, behavior: "smooth" });
   }, [messages, chatFetcher.state]);
 
   const isThinking = chatFetcher.state !== "idle";
+
+  /** Resolve a pending write by either removing it (cancel) or replacing it
+   *  with the action returned by /app/chat/approve. Called by PendingWriteCard. */
+  const resolveWrite = (params: { messageId: string; nonce: string; action?: ChatAction }) => {
+    setMessages((ms) =>
+      ms.map((m) => {
+        if (m.id !== params.messageId) return m;
+        const remaining = (m.pendingWrites ?? []).filter((p) => p.nonce !== params.nonce);
+        const actions = params.action ? [...(m.actions ?? []), params.action] : (m.actions ?? []);
+        return { ...m, pendingWrites: remaining, actions };
+      }),
+    );
+    if (params.action) {
+      shopify.toast.show(params.action.ok ? "Approved — done" : "Write failed", { isError: !params.action.ok });
+    }
+  };
+
+  // Drain approve fetcher results back into the message list.
+  useEffect(() => {
+    if (approveFetcher.state === "idle" && approveFetcher.data) {
+      const meta = approveFetcherRef.current;
+      if (meta) {
+        resolveWrite({ messageId: meta.messageId, nonce: meta.nonce, action: approveFetcher.data.action });
+        if (approveFetcher.data.error) shopify.toast.show(approveFetcher.data.error, { isError: true });
+        approveFetcherRef.current = null;
+      }
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [approveFetcher.data, approveFetcher.state]);
+
+  // Track which pending write is in-flight so we know where to slot the result.
+  const approveFetcherRef = useRef<{ messageId: string; nonce: string } | null>(null);
 
   const send = (text: string) => {
     const trimmed = text.trim();
@@ -157,6 +217,7 @@ export default function ReeveChat() {
           reasoning: chatFetcher.data.reasoning ?? null,
           elapsedMs: chatFetcher.data.elapsedMs ?? null,
           actions: chatFetcher.data.actions ?? null,
+          pendingWrites: chatFetcher.data.pendingWrites ?? [],
         }]);
         shopify.toast.show("Reeve replied");
         fetcher.load("/app");
@@ -332,6 +393,13 @@ function MessageRow({ msg }: { msg: Message }) {
           </div>
         </div>
       </div>
+      {msg.pendingWrites && msg.pendingWrites.length > 0 && (
+        <div style={{ marginTop: "10px", marginLeft: "28px", display: "flex", flexDirection: "column", gap: "8px" }}>
+          {msg.pendingWrites.map((pw) => (
+            <PendingWriteCard key={pw.nonce} messageId={msg.id} write={pw} onResolved={resolveWrite} />
+          ))}
+        </div>
+      )}
       {msg.actions && msg.actions.length > 0 && (
         <div style={{ marginTop: "10px", marginLeft: "28px", display: "flex", flexDirection: "column", gap: "6px" }}>
           {msg.actions.map((a, i) => <ActionCard key={i} action={a} />)}
@@ -521,6 +589,78 @@ function CardButton({ label }: { label: string }) {
     >
       {label}
     </button>
+  );
+}
+
+/** Pending write card. The agent proposed a mutation but did NOT execute it.
+ *  Shows the summary + Approve/Cancel. Approve posts to /app/chat/approve;
+ *  on response the parent swaps this card for a real action card. */
+function PendingWriteCard({ messageId, write, onResolved }: {
+  messageId: string;
+  write: PendingWrite;
+  onResolved: (params: { messageId: string; nonce: string; action?: ChatAction }) => void;
+}) {
+  const [submitting, setSubmitting] = useState(false);
+  const onApprove = () => {
+    if (submitting) return;
+    setSubmitting(true);
+    // Reuse the approveFetcher. We need to track its target so we know where
+    // to slot the result when it lands. Done via approveFetcherRef on the parent.
+    window.dispatchEvent(new CustomEvent("reeve:approve", {
+      detail: { messageId, nonce: write.nonce, tool: write.tool, args: write.args },
+    }));
+  };
+  useEffect(() => {
+    if (!submitting) return;
+    // Listen for the parent's resolution broadcast for THIS nonce.
+    const handler = (e: Event) => {
+      const d = (e as CustomEvent<{ nonce: string }>).detail;
+      if (d.nonce === write.nonce) {
+        setSubmitting(false);
+      }
+    };
+    window.addEventListener("reeve:approve-resolved", handler as EventListener);
+    return () => window.removeEventListener("reeve:approve-resolved", handler as EventListener);
+  }, [submitting, write.nonce]);
+
+  return (
+    <div style={{
+      border: `1px solid ${C.accentBlue}55`, borderRadius: "10px", background: C.bg,
+      padding: "10px 12px", boxShadow: "0 1px 3px rgba(26,115,232,0.08)",
+    }}>
+      <div style={{ display: "flex", alignItems: "center", gap: "8px", marginBottom: "8px" }}>
+        <span style={{ color: C.accentBlue, fontSize: "13px", fontWeight: 700 }}>{"\u270E"}</span>
+        <span style={{ fontSize: "11px", fontWeight: 600, color: C.accentBlue, textTransform: "uppercase", letterSpacing: "0.04em" }}>
+          Proposed write
+        </span>
+        <span style={{ flex: 1 }} />
+        <span style={{ fontSize: "10px", color: C.textMuted }}>Awaiting approval</span>
+      </div>
+      <div style={{ fontSize: "13px", color: C.textPrimary, marginBottom: "10px", fontFamily: 'ui-monospace, "SF Mono", Menlo, monospace' }}>
+        {write.summary}
+      </div>
+      <div style={{ display: "flex", gap: "8px" }}>
+        <button
+          type="button"
+          disabled={submitting}
+          onClick={onApprove}
+          style={{
+            border: "none", borderRadius: "8px", padding: "6px 16px", fontSize: "12px", fontWeight: 600,
+            background: submitting ? C.border : C.accentBlue, color: "#fff", cursor: submitting ? "default" : "pointer",
+            fontFamily: "inherit",
+          }}
+        >{submitting ? "Approving…" : "Approve"}</button>
+        <button
+          type="button"
+          disabled={submitting}
+          onClick={() => onResolved({ messageId, nonce: write.nonce })}
+          style={{
+            border: `1px solid ${C.border}`, borderRadius: "8px", padding: "6px 16px", fontSize: "12px", fontWeight: 500,
+            background: C.bg, color: C.textMuted, cursor: submitting ? "default" : "pointer", fontFamily: "inherit",
+          }}
+        >Cancel</button>
+      </div>
+    </div>
   );
 }
 
