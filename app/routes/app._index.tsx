@@ -1,13 +1,13 @@
 // app/routes/app._index.tsx — Reeve AI as a FULL-PAGE chat.
 //
-// The whole app surface is the chat. No KPI tiles, no panels, no aside — just
-// a big chat that fills the page. The inventory summary + activity are loaded
-// for the agent to reference + shown as a welcome context card before the first
-// message, but the chat is the hero and occupies everything.
+// Gemini-style redesign: white page, near-black text, grey surfaces, blue
+// accent. No header bar — just a tiny corner pill. No avatars, no bubbles
+// on the assistant side. Suggestion chips shown only on the empty homepage.
 //
-// Custom-element rule: Polaris web components only for static display. The chat
-// (textarea, send button, message bubbles, chips) is plain native DOM with
-// standard React controlled binding.
+// Custom-element rule: Polaris web components only for static display. The
+// chat (textarea, send button, message rows, chips) is plain native DOM with
+// standard React controlled binding. The backend (loader, send, fetcher,
+// chat route, agent, tools, audit) is untouched — only the visual layer.
 
 import { useEffect, useRef, useState } from "react";
 import type { HeadersFunction, LoaderFunctionArgs } from "react-router";
@@ -15,10 +15,24 @@ import { useFetcher, useLoaderData } from "react-router";
 import { useAppBridge } from "@shopify/app-bridge-react";
 import { authenticate } from "../shopify.server";
 import { boundary } from "@shopify/shopify-app-react-router/server";
-import { getActivities } from "../lib/audit.server";
 import prisma from "../db.server";
 
-// ─── Loader ───────────────────────────────────────────────────────────────────
+// ─── Color tokens (single source of truth) ─────────────────────────────────
+const C = {
+  bg: "#FFFFFF",
+  textPrimary: "#1F1F1F",
+  textMuted: "#5F6368",
+  surface: "#F0F0F0", // user bubbles, chips
+  surface2: "#F8F9FA", // thinking bg
+  border: "#E5E5E5",
+  accentBlue: "#1A73E8", // send button, focus ring, success ticks
+  dangerRed: "#D93025", // error ticks
+  okGreen: "#1E8E3E", // alt success accent
+} as const;
+
+const CONTENT_MAX = 720; // px — Gemini's content width feel
+
+// ─── Loader (unchanged) ──────────────────────────────────────────────────────
 
 interface InventorySummary { total: number; inStock: number; lowStock: number; outOfStock: number; topLow: { id: string; title: string; inventory: number }[] }
 interface ChatAction { name: string; summary: string; ok: boolean; error?: string }
@@ -64,7 +78,7 @@ export const loader = async ({ request }: LoaderFunctionArgs): Promise<LoaderDat
   };
 };
 
-// ─── Full-page chat ─────────────────────────────────────────────────────────────
+// ─── Full-page chat ─────────────────────────────────────────────────────────
 
 export default function ReeveChat() {
   const { summary, messages: initialMessages, provider } = useLoaderData<typeof loader>();
@@ -115,164 +129,228 @@ export default function ReeveChat() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [chatFetcher.data, chatFetcher.state]);
 
-  const showWelcome = messages.length === 0;
+  const empty = messages.length === 0;
 
   return (
-    <div style={{ display: "flex", flexDirection: "column", height: "100vh", maxHeight: "100vh", background: "#fff" }}>
-      {/* ─── Header ─── */}
-      <div style={{ display: "flex", alignItems: "center", gap: "12px", padding: "14px 20px", borderBottom: "1px solid #e1e1e1", background: "#000", color: "#fff", flexShrink: 0 }}>
-        <div style={{ width: "36px", height: "36px", borderRadius: "50%", background: "#FFD60A", color: "#000", display: "flex", alignItems: "center", justifyContent: "center", fontWeight: 700, fontSize: "17px" }}>R</div>
-        <div style={{ flex: 1 }}>
-          <div style={{ fontSize: "16px", fontWeight: 600 }}>Reeve AI</div>
-          <div style={{ fontSize: "12px", opacity: 0.7 }}>Your Shopify inventory intern · {provider === "nvidia" ? "Live AI" : "Demo mode"}</div>
-        </div>
-        <div style={{ background: provider === "nvidia" ? "#008060" : "#FFD60A", color: provider === "nvidia" ? "#fff" : "#000", padding: "3px 10px", borderRadius: "999px", fontSize: "11px", fontWeight: 600 }}>
-          {provider === "nvidia" ? "● Live" : "Demo"}
-        </div>
+    <div style={{ position: "relative", display: "flex", flexDirection: "column", height: "100vh", maxHeight: "100vh", background: C.bg, fontFamily: '"Inter", system-ui, -apple-system, sans-serif' }}>
+
+      {/* ─── Corner pill (replaces header bar) ─── */}
+      <div style={{ position: "absolute", top: "16px", left: "20px", display: "flex", alignItems: "center", gap: "10px", pointerEvents: "none", zIndex: 5 }}>
+        <span style={{ fontSize: "15px", fontWeight: 500, color: C.textPrimary, letterSpacing: "-0.01em" }}>Reeve</span>
+        <span style={{
+          display: "inline-flex", alignItems: "center", gap: "5px",
+          padding: "2px 9px", borderRadius: "999px", fontSize: "11px", fontWeight: 500,
+          background: provider === "nvidia" ? "rgba(26,115,232,0.10)" : C.surface,
+          color: provider === "nvidia" ? C.accentBlue : C.textMuted,
+        }}>
+          <span style={{ width: "6px", height: "6px", borderRadius: "50%", background: provider === "nvidia" ? C.accentBlue : C.textMuted }} />
+          {provider === "nvidia" ? "Live AI" : "Demo"}
+        </span>
       </div>
 
-      {/* ─── Messages (fills available space) ─── */}
-      <div ref={scrollRef} style={{ flex: 1, overflowY: "auto", padding: "24px 20px", maxWidth: "820px", width: "100%", margin: "0 auto" }}>
-        {showWelcome && (
-          <WelcomeCard summary={summary} />
+      {/* ─── Messages (or homepage empty state) ─── */}
+      <div ref={scrollRef} style={{ flex: 1, overflowY: "auto", padding: empty ? "0 24px" : "72px 24px 24px", maxWidth: `${CONTENT_MAX}px`, width: "100%", margin: "0 auto", boxSizing: "border-box" }}>
+        {empty ? (
+          <WelcomeHome summary={summary} onPick={(text) => send(text)} disabled={isThinking} />
+        ) : (
+          <>
+            {messages.map((m) => <MessageRow key={m.id} msg={m} />)}
+            {isThinking && (
+              <div style={{ display: "inline-flex", gap: "5px", alignItems: "center", padding: "10px 0", marginLeft: "2px" }}>
+                <span style={thinkingDot(0)} />
+                <span style={thinkingDot(1)} />
+                <span style={thinkingDot(2)} />
+              </div>
+            )}
+          </>
         )}
-        {messages.map((m) => <MessageBubble key={m.id} msg={m} />)}
-        {isThinking && (
-          <div style={{ display: "flex", gap: "8px", alignItems: "center", color: "#666", fontSize: "14px", padding: "12px 0" }}>
-            <div style={{ width: "28px", height: "28px", borderRadius: "50%", background: "#000", color: "#FFD60A", display: "flex", alignItems: "center", justifyContent: "center", fontWeight: 700, fontSize: "12px" }}>R</div>
-            <span style={dotStyle(0)} /><span style={dotStyle(1)} /><span style={dotStyle(2)} />
-            <span>Reeve is thinking…</span>
-          </div>
-        )}
-      </div>
-
-      {/* ─── Suggestion chips (above composer) ─── */}
-      <div style={{ maxWidth: "820px", width: "100%", margin: "0 auto", padding: "0 20px 8px", display: "flex", flexWrap: "wrap", gap: "8px", flexShrink: 0 }}>
-        {SUGGESTIONS.map((s) => (
-          <button key={s.label} onClick={() => send(s.message)} disabled={isThinking} style={chipStyle}>{s.label}</button>
-        ))}
       </div>
 
       {/* ─── Composer ─── */}
-      <div style={{ maxWidth: "820px", width: "100%", margin: "0 auto", padding: "12px 20px 20px", borderTop: "1px solid #f0f0f0", flexShrink: 0 }}>
-        <div style={{ display: "flex", gap: "10px", alignItems: "flex-end", background: "#f6f6f7", border: "1px solid #e1e1e1", borderRadius: "12px", padding: "8px" }}>
+      <div style={{ maxWidth: `${CONTENT_MAX}px`, width: "100%", margin: "0 auto", padding: "8px 24px 24px", boxSizing: "border-box", flexShrink: 0 }}>
+        <div
+          style={{
+            display: "flex", alignItems: "flex-end", gap: "8px",
+            background: C.bg, border: `1px solid ${C.border}`, borderRadius: "24px",
+            padding: "8px 8px 8px 18px", boxShadow: "0 1px 6px rgba(60,64,67,0.08)",
+            transition: "box-shadow 0.15s ease, border-color 0.15s ease",
+          }}
+        >
           <textarea
             value={input}
             onChange={(e) => setInput(e.target.value)}
-            onKeyDown={(e) => { if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); send(input); } }}
-            placeholder="Ask Reeve about your inventory…  (Enter to send)"
-            rows={1}
-            style={{ flex: 1, resize: "none", border: "none", background: "transparent", fontSize: "15px", fontFamily: "inherit", outline: "none", maxHeight: "120px", lineHeight: 1.5 }}
-          />
-          <button
-            onClick={() => send(input)}
-            disabled={!input.trim() || isThinking}
-            style={{
-              background: input.trim() && !isThinking ? "#000" : "#ccc",
-              color: "#FFD60A", border: "none", borderRadius: "8px",
-              padding: "0 16px", height: "38px",
-              cursor: input.trim() && !isThinking ? "pointer" : "default",
-              fontWeight: 600, fontSize: "14px", flexShrink: 0,
+            onKeyDown={(e) => {
+              if (e.key === "Enter" && !e.shiftKey) {
+                e.preventDefault();
+                send(input);
+              }
             }}
-          >
-            Send
-          </button>
+            placeholder="Ask Reeve about your inventory…  (Enter to send, Shift+Enter for newline)"
+            rows={1}
+            style={{
+              flex: 1, resize: "none", border: "none", background: "transparent",
+              fontSize: "15px", lineHeight: 1.5, color: C.textPrimary,
+              fontFamily: "inherit", outline: "none", maxHeight: "160px", padding: "6px 0",
+            }}
+          />
+          <SendButton active={!!input.trim() && !isThinking} onClick={() => send(input)} disabled={!input.trim() || isThinking} />
         </div>
+        <p style={{ textAlign: "center", color: C.textMuted, fontSize: "11px", margin: "8px 0 0" }}>
+          Reeve can act on your store — review suggested actions before confirming.
+        </p>
       </div>
     </div>
   );
 }
 
-// ─── Sub-components ───────────────────────────────────────────────────────────
+// ─── Homepage empty state ───────────────────────────────────────────────────
 
 const SUGGESTIONS = [
   { label: "What's running low?", message: "What's running low?" },
   { label: "Summarize my inventory", message: "Summarize my inventory health" },
   { label: "Show my products", message: "Show me my products" },
-  { label: "Mark out-of-stock items unavailable", message: "Find out-of-stock items and mark them as DRAFT/unavailable" },
+  { label: "Mark out-of-stock unavailable", message: "Find out-of-stock items and mark them as DRAFT/unavailable" },
 ];
 
-function WelcomeCard({ summary }: { summary: InventorySummary }) {
+function WelcomeHome({ summary, onPick, disabled }: { summary: InventorySummary; onPick: (text: string) => void; disabled: boolean }) {
   return (
-    <div style={{ textAlign: "center", padding: "40px 20px 32px" }}>
-      <div style={{ width: "56px", height: "56px", borderRadius: "50%", background: "#000", color: "#FFD60A", display: "inline-flex", alignItems: "center", justifyContent: "center", fontWeight: 700, fontSize: "26px", marginBottom: "16px" }}>R</div>
-      <h1 style={{ fontSize: "24px", fontWeight: 700, margin: "0 0 8px" }}>Reeve AI</h1>
-      <p style={{ fontSize: "15px", color: "#666", margin: "0 0 24px", maxWidth: "440px", marginLeft: "auto", marginRight: "auto" }}>
-        Your Shopify inventory intern. Ask me what's running low, have me restock items, update prices, or mark products unavailable — I'll act on your store directly.
+    <div style={{ minHeight: "100%", display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center", padding: "32px 0", textAlign: "center" }}>
+      <h1 style={{ fontSize: "40px", fontWeight: 500, letterSpacing: "-0.02em", color: C.textPrimary, margin: "0 0 12px" }}>
+        Hello, Omar
+      </h1>
+      <p style={{ fontSize: "16px", color: C.textMuted, margin: "0 0 32px", maxWidth: "440px" }}>
+        Ask Reeve about your inventory — what's low, restock, update prices, or mark products unavailable.
       </p>
+
       {summary.total > 0 && (
-        <div style={{ display: "flex", gap: "12px", justifyContent: "center", flexWrap: "wrap" }}>
-          <SummaryPill label="Products" value={summary.total} />
-          <SummaryPill label="Low stock" value={summary.lowStock} tone="#B86E00" />
-          <SummaryPill label="Out of stock" value={summary.outOfStock} tone="#D72C0D" />
+        <div style={{ display: "flex", gap: "10px", justifyContent: "center", flexWrap: "wrap", marginBottom: "28px" }}>
+          <StatChip label="Products" value={summary.total} />
+          <StatChip label="In stock" value={summary.inStock} tone={C.okGreen} />
+          <StatChip label="Low stock" value={summary.lowStock} tone={C.accentBlue} />
+          <StatChip label="Out of stock" value={summary.outOfStock} tone={C.dangerRed} />
+        </div>
+      )}
+
+      <div style={{ display: "flex", gap: "8px", flexWrap: "wrap", justifyContent: "center", maxWidth: "560px" }}>
+        {SUGGESTIONS.map((s) => (
+          <button
+            key={s.label}
+            onClick={() => onPick(s.message)}
+            disabled={disabled}
+            style={{
+              border: `1px solid ${C.border}`, background: C.bg, borderRadius: "999px",
+              padding: "9px 16px", fontSize: "13px", color: C.textPrimary, cursor: disabled ? "default" : "pointer",
+              fontFamily: "inherit", transition: "background 0.12s ease",
+            }}
+          >
+            {s.label}
+          </button>
+        ))}
+      </div>
+    </div>
+  );
+}
+
+function StatChip({ label, value, tone }: { label: string; value: number; tone?: string }) {
+  return (
+    <div style={{
+      background: C.surface2, border: `1px solid ${C.border}`, borderRadius: "10px",
+      padding: "8px 16px", minWidth: "84px",
+    }}>
+      <div style={{ fontSize: "20px", fontWeight: 600, color: tone ?? C.textPrimary, lineHeight: 1.2 }}>{value}</div>
+      <div style={{ fontSize: "10px", color: C.textMuted, textTransform: "uppercase", letterSpacing: "0.05em", marginTop: "2px" }}>{label}</div>
+    </div>
+  );
+}
+
+// ─── Chat messages ──────────────────────────────────────────────────────────
+
+function MessageRow({ msg }: { msg: Message }) {
+  const isUser = msg.role === "user";
+  if (isUser) {
+    return (
+      <div style={{ display: "flex", justifyContent: "flex-end", marginBottom: "18px" }}>
+        <div style={{
+          maxWidth: "78%", padding: "10px 16px",
+          background: C.surface, color: C.textPrimary,
+          borderRadius: "16px", fontSize: "14px", lineHeight: 1.6,
+          whiteSpace: "pre-wrap", wordBreak: "break-word",
+        }}>
+          {msg.content}
+        </div>
+      </div>
+    );
+  }
+  return (
+    <div style={{ marginBottom: "22px" }}>
+      <div style={{ fontSize: "14px", lineHeight: 1.7, color: C.textPrimary, whiteSpace: "pre-wrap", wordBreak: "break-word" }}>
+        {msg.content}
+      </div>
+      {msg.actions && msg.actions.length > 0 && (
+        <div style={{ marginTop: "10px", display: "flex", flexDirection: "column", gap: "6px" }}>
+          {msg.actions.map((a, i) => <ActionCard key={i} action={a} />)}
         </div>
       )}
     </div>
   );
 }
 
-function SummaryPill({ label, value, tone }: { label: string; value: number; tone?: string }) {
+function ActionCard({ action: a }: { action: ChatAction }) {
+  const color = a.ok ? C.accentBlue : C.dangerRed;
   return (
-    <div style={{ background: "#f6f6f7", border: "1px solid #e1e1e1", borderRadius: "10px", padding: "10px 18px", minWidth: "90px" }}>
-      <div style={{ fontSize: "22px", fontWeight: 700, color: tone ?? "#000" }}>{value}</div>
-      <div style={{ fontSize: "11px", color: "#666", textTransform: "uppercase", letterSpacing: "0.04em" }}>{label}</div>
+    <div style={{
+      border: `1px solid ${C.border}`, borderRadius: "8px",
+      padding: "8px 12px", background: C.bg, fontSize: "12px",
+    }}>
+      <div style={{ display: "flex", alignItems: "center", gap: "8px" }}>
+        <span style={{ color, fontWeight: 700, fontSize: "13px" }}>{a.ok ? "✓" : "✗"}</span>
+        <span style={{ fontWeight: 500, color: C.textPrimary }}>{a.summary}</span>
+      </div>
+      {a.error && <div style={{ color: C.dangerRed, marginTop: "3px", fontSize: "11px" }}>{a.error}</div>}
     </div>
   );
 }
 
-function MessageBubble({ msg }: { msg: Message }) {
-  const isUser = msg.role === "user";
+// ─── Composer pieces ────────────────────────────────────────────────────────
+
+function SendButton({ active, onClick, disabled }: { active: boolean; onClick: () => void; disabled: boolean }) {
   return (
-    <div style={{ marginBottom: "20px", display: "flex", gap: "12px", flexDirection: isUser ? "row-reverse" : "row" }}>
-      {/* Avatar */}
-      <div style={{
-        width: "32px", height: "32px", borderRadius: "50%", flexShrink: 0,
-        background: isUser ? "#444" : "#000", color: isUser ? "#fff" : "#FFD60A",
+    <button
+      onClick={onClick}
+      disabled={disabled}
+      aria-label="Send message"
+      style={{
+        width: "36px", height: "36px", borderRadius: "50%",
+        border: "none", flexShrink: 0,
+        background: active ? C.accentBlue : C.border,
+        color: "#fff", cursor: disabled ? "default" : "pointer",
         display: "flex", alignItems: "center", justifyContent: "center",
-        fontWeight: 700, fontSize: "13px",
-      }}>
-        {isUser ? "You" : "R"}
-      </div>
-      {/* Bubble + actions */}
-      <div style={{ maxWidth: "75%" }}>
-        <div style={{
-          padding: "12px 16px", borderRadius: isUser ? "16px 16px 4px 16px" : "16px 16px 16px 4px",
-          background: isUser ? "#000" : "#f6f6f7", color: isUser ? "#fff" : "#000",
-          fontSize: "14px", lineHeight: 1.6, whiteSpace: "pre-wrap", wordBreak: "break-word",
-        }}>
-          {msg.content}
-        </div>
-        {msg.actions && msg.actions.length > 0 && (
-          <div style={{ marginTop: "8px", display: "flex", flexDirection: "column", gap: "6px" }}>
-            {msg.actions.map((a, i) => (
-              <div key={i} style={{
-                border: "1px solid", borderRadius: "8px", padding: "8px 12px", fontSize: "12px",
-                background: a.ok ? "#fff" : "#FFF5F5", borderColor: a.ok ? "#e1e1e1" : "#FFCACA",
-              }}>
-                <div style={{ display: "flex", alignItems: "center", gap: "6px" }}>
-                  <span style={{ color: a.ok ? "#008060" : "#D72C0D", fontWeight: 700 }}>{a.ok ? "✓" : "✗"}</span>
-                  <span style={{ fontWeight: 600 }}>{a.summary}</span>
-                </div>
-                {a.error && <div style={{ color: "#D72C0D", marginTop: "2px", fontSize: "11px" }}>{a.error}</div>}
-              </div>
-            ))}
-          </div>
-        )}
-      </div>
-    </div>
+        fontSize: "18px", fontWeight: 700, lineHeight: 1,
+        transition: "background 0.15s ease",
+      }}
+    >
+      ↑
+    </button>
   );
 }
 
-const chipStyle: React.CSSProperties = {
-  border: "1px solid #e1e1e1", background: "#fff", borderRadius: "999px",
-  padding: "6px 14px", fontSize: "13px", color: "#444", cursor: "pointer",
-};
-function dotStyle(delay: number): React.CSSProperties {
-  return { display: "inline-block", width: "7px", height: "7px", borderRadius: "50%", background: "#999", animation: "reeveBounce 1s infinite", animationDelay: `${delay * 0.15}s` };
+function thinkingDot(delay: number): React.CSSProperties {
+  return {
+    display: "inline-block", width: "7px", height: "7px", borderRadius: "50%",
+    background: C.textMuted, opacity: 0.6,
+    animation: "reevePulse 1.2s ease-in-out infinite", animationDelay: `${delay * 0.18}s`,
+  };
 }
+
+// ─── Per-route CSS (keyframes only) + headers ────────────────────────────
 
 export const links = () => [
-  { rel: "stylesheet", href: "data:text/css," + encodeURIComponent("@keyframes reeveBounce{0%,80%,100%{transform:scale(0.6);opacity:0.5}40%{transform:scale(1);opacity:1}}") },
+  {
+    rel: "stylesheet",
+    href: "data:text/css," + encodeURIComponent(
+      "@keyframes reevePulse{0%,100%{opacity:0.25;transform:scale(0.85)}50%{opacity:0.9;transform:scale(1)}}",
+    ),
+  },
 ];
 
 export const headers: HeadersFunction = (headersArgs) => boundary.headers(headersArgs);
