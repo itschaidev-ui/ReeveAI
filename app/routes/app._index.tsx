@@ -635,7 +635,7 @@ function greetingSubline(summary: InventorySummary): string {
     return `${summary.lowStock} ${summary.lowStock === 1 ? "item is" : "items are"} at or below 5 units. Want me to generate a restock report for them?`;
   }
   if (summary.total === 0) {
-    return "Once you add products to this store I can watch stock levels, suggest restocks, and keep availability in sync. Try me by asking "What's running low?" after you add inventory.";
+    return "Once you add products to this store I can watch stock levels, suggest restocks, and keep availability in sync. Try me by asking 'What's running low?' after you add inventory.";
   }
   return "Your stock levels look good. Ask me to summarize inventory, show low-stock items, or update a price.";
 }
