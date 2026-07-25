@@ -178,7 +178,19 @@ export async function runAgent(params: {
   );
   const elapsedMs = Date.now() - startedAt;
   const tag = answerResult.provider === "nvidia" ? "" : " (demo mode — set NVIDIA_API_KEY for live AI)";
-  const response = (answerResult.answer || "Done.").trim() + tag;
+  let response = (answerResult.answer || "Done.").trim() + tag;
+
+  // HARD BACKSTOP against hallucination. If the body claims a write happened
+  // (proposed/done/applied/set/updated/marked/restocked) but the agent loop
+  // collected zero pendingWrites AND executed zero write actions, override the
+  // body with a truthful correction. The model has been observed saying "I have
+  // proposed setting all 18 products to ACTIVE" while emitting zero write tool
+  // calls — this catches that lie deterministically.
+  const writeClaimRegex = /\b(i have|ive|i|we)\s+(proposed|set|marked|updated|changed|applied|restocked|made)\b/i;
+  const noWritesThisTurn = pendingWrites.length === 0 && !actions.some((a) => isWriteTool(a.name));
+  if (noWritesThisTurn && writeClaimRegex.test(response)) {
+    response = "I wasn\'t able to propose any writes this turn — I can show you the relevant products, but to actually change one I\'ll need you to ask about a specific product by name. Which product would you like me to update, and to what?";
+  }
 
   // 5. Persist + audit.
   await prisma.chatMessage.create({ data: { shop, role: "user", content: message } });
