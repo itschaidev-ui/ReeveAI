@@ -327,7 +327,7 @@ export default function ReeveChat() {
           <WelcomeHome summary={summary} onPick={(text) => send(text)} disabled={isThinking} />
         ) : (
           <>
-            {messages.map((m) => <MessageRow key={m.id} msg={m} />)}
+            {messages.map((m) => <MessageRow key={m.id} msg={m} resolveWrite={resolveWrite} />)}
             {isThinking && (
               <ThinkingRow />
             )}
@@ -434,7 +434,7 @@ function StatChip({ label, value, tone }: { label: string; value: number; tone?:
 
 // ─── Chat messages ──────────────────────────────────────────────────────────
 
-function MessageRow({ msg }: { msg: Message }) {
+function MessageRow({ msg, resolveWrite }: { msg: Message; resolveWrite: (params: { messageId: string; nonce: string; action?: ChatAction }) => void }) {
   const isUser = msg.role === "user";
   if (isUser) {
     return (
