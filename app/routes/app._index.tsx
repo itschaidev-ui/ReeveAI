@@ -16,6 +16,7 @@ import { useAppBridge } from "@shopify/app-bridge-react";
 import { authenticate } from "../shopify.server";
 import { boundary } from "@shopify/shopify-app-react-router/server";
 import prisma from "../db.server";
+import type { ReasoningEffort } from "../lib/llm.server";
 
 // ─── Color tokens (single source of truth) ─────────────────────────────────
 const C = {
@@ -100,8 +101,19 @@ export default function ReeveChat() {
 
   const [messages, setMessages] = useState<Message[]>(initialMessages);
   const [input, setInput] = useState("");
+  const [effort, setEffort] = useState<ReasoningEffort>("medium");
   const scrollRef = useRef<HTMLDivElement>(null);
   const lastReplyRef = useRef<string | null>(null);
+
+  // Session-persist the reasoning-effort choice (until the Conversation model lands,
+  // this is global per-browser; per-chat persistence follows in the next commit).
+  useEffect(() => {
+    const saved = typeof localStorage !== "undefined" ? localStorage.getItem("reeve.effort") : null;
+    if (saved === "medium" || saved === "high" || saved === "max") setEffort(saved);
+  }, []);
+  useEffect(() => {
+    try { localStorage.setItem("reeve.effort", effort); } catch { /* ignore */ }
+  }, [effort]);
 
   useEffect(() => {
     if (fetcher.data?.messages) setMessages(fetcher.data.messages);
@@ -119,7 +131,7 @@ export default function ReeveChat() {
     setMessages((m) => [...m, { id: `u-${Date.now()}`, role: "user", content: trimmed }]);
     setInput("");
     lastReplyRef.current = null;
-    chatFetcher.submit({ message: trimmed }, { method: "POST", action: "/app/chat", encType: "application/json" });
+    chatFetcher.submit({ message: trimmed, effort }, { method: "POST", action: "/app/chat", encType: "application/json" });
   };
 
   useEffect(() => {
@@ -150,7 +162,7 @@ export default function ReeveChat() {
     <div style={{ position: "relative", display: "flex", flexDirection: "column", height: "100vh", maxHeight: "100vh", background: C.bg, fontFamily: '"Inter", system-ui, -apple-system, sans-serif' }}>
 
       {/* ─── Corner pill (replaces header bar) ─── */}
-      <div style={{ position: "absolute", top: "16px", left: "20px", display: "flex", alignItems: "center", gap: "10px", pointerEvents: "none", zIndex: 5 }}>
+      <div style={{ position: "absolute", top: "14px", left: "20px", right: "20px", display: "flex", alignItems: "center", gap: "10px", zIndex: 5 }}>
         <span style={{ fontSize: "15px", fontWeight: 500, color: C.textPrimary, letterSpacing: "-0.01em" }}>Reeve</span>
         <span style={{
           display: "inline-flex", alignItems: "center", gap: "5px",
@@ -161,6 +173,9 @@ export default function ReeveChat() {
           <span style={{ width: "6px", height: "6px", borderRadius: "50%", background: provider === "nvidia" ? C.accentBlue : C.textMuted }} />
           {provider === "nvidia" ? "Live AI" : "Demo"}
         </span>
+        <div style={{ marginLeft: "auto" }}>
+          <EffortDropdown value={effort} onChange={setEffort} disabled={isThinking} />
+        </div>
       </div>
 
       {/* ─── Messages (or homepage empty state) ─── */}
@@ -171,8 +186,8 @@ export default function ReeveChat() {
           <>
             {messages.map((m) => <MessageRow key={m.id} msg={m} />)}
             {isThinking && (
-              <div style={{ display: "flex", gap: "10px", alignItems: "center", padding: "10px 0 12px" }}>
-                <ReeveThinkingIcon />
+              <div style={{ display: "flex", gap: "12px", alignItems: "center", padding: "10px 0 12px" }}>
+                <ReeveThinkingIcon size={36} />
                 <span style={{ fontSize: "13px", color: C.textMuted, fontWeight: 500 }}>Thinking</span>
                 <span style={thinkingDot(0)} />
                 <span style={thinkingDot(1)} />
@@ -302,7 +317,7 @@ function MessageRow({ msg }: { msg: Message }) {
     <div style={{ marginBottom: "22px" }}>
       <div style={{ display: "flex", gap: "10px", alignItems: "flex-start" }}>
         <div style={{ flexShrink: 0, paddingTop: "2px" }}>
-          <ReeveIcon cardColor={C.textPrimary} size={18} />
+          <ReeveIcon cardColor={C.textPrimary} size={36} />
         </div>
         <div style={{ flex: 1, minWidth: 0 }}>
           {msg.reasoning && msg.reasoning.trim() && <ReasoningChip reasoning={msg.reasoning} elapsedMs={msg.elapsedMs} />}
@@ -372,6 +387,37 @@ function ActionCard({ action: a }: { action: ChatAction }) {
 
 // ─── Composer pieces ────────────────────────────────────────────────────────
 
+const EFFORTS: { value: ReasoningEffort; label: string; hint: string }[] = [
+  { value: "medium", label: "Thinking: Medium", hint: "Fast — balanced reasoning + answer" },
+  { value: "high", label: "Thinking: High", hint: "Deeper reasoning, slower" },
+  { value: "max", label: "Thinking: Max", hint: "Deepest reasoning + larger answer budget" },
+];
+
+function EffortDropdown({ value, onChange, disabled }: { value: ReasoningEffort; onChange: (e: ReasoningEffort) => void; disabled: boolean }) {
+  return (
+    <label style={{
+      display: "inline-flex", alignItems: "center", gap: "6px",
+      fontSize: "11px", fontWeight: 500, color: C.textMuted,
+      background: C.surface2, border: `1px solid ${C.border}`, borderRadius: "999px",
+      padding: "3px 10px 3px 12px", cursor: disabled ? "default" : "pointer", userSelect: "none",
+    }}>
+      <select
+        value={value}
+        disabled={disabled}
+        onChange={(e) => onChange(e.target.value as ReasoningEffort)}
+        title={EFFORTS.find((x) => x.value === value)?.hint ?? ""}
+        style={{
+          border: "none", background: "transparent", fontFamily: "inherit",
+          fontSize: "11px", fontWeight: 500, color: C.textMuted,
+          outline: "none", cursor: disabled ? "default" : "pointer", padding: 0,
+        }}
+      >
+        {EFFORTS.map((e) => <option key={e.value} value={e.value}>{e.label}</option>)}
+      </select>
+    </label>
+  );
+}
+
 function SendButton({ active, onClick, disabled }: { active: boolean; onClick: () => void; disabled: boolean }) {
   return (
     <button
@@ -404,7 +450,7 @@ function thinkingDot(delay: number): React.CSSProperties {
 // ─── Reeve brand icon (rounded-square card + inverted R silhouette) ─────────
 // Card color follows `cardColor`; the R silhouette stays white. Pass muted grey
 // while the agent is generating, full black once the reply has landed.
-function ReeveIcon({ cardColor = "#1F1F1F", size = 18 }: { cardColor?: string; size?: number }) {
+function ReeveIcon({ cardColor = "#1F1F1F", size = 36 }: { cardColor?: string; size?: number }) {
   // Only the R glyph is rendered — no rounded-square card behind it. cardColor
   // controls the R fill (muted grey during generation, near-black when done).
   const h = Math.round((size * 1038) / 1156);
@@ -421,7 +467,7 @@ function ReeveIcon({ cardColor = "#1F1F1F", size = 18 }: { cardColor?: string; s
 /** Thinking-row icon: muted-grey R glyph + a horizontal light sweep that plays
  *  only while the agent is generating. The sweep is a thin translucent white
  *  bar that travels left-to-right across the R glyph. */
-function ReeveThinkingIcon({ size = 18 }: { size?: number }) {
+function ReeveThinkingIcon({ size = 36 }: { size?: number }) {
   return (
     <div style={{ position: "relative", width: `${size}px`, height: `${Math.round((size * 1038) / 1156)}px`, overflow: "hidden", borderRadius: "3px", flexShrink: 0 }}>
       <ReeveIcon cardColor={C.textMuted} size={size} />
