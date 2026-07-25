@@ -131,8 +131,41 @@ export default function ReeveChat() {
     try { localStorage.setItem("reeve.effort", effort); } catch { /* ignore */ }
   }, [effort]);
 
+  // When the loader refreshes (after a reply lands), MERGE its DB-persisted
+  // messages with our in-flight optimistic state instead of blindly replacing.
+  // This preserves pendingWrites (which are NOT persisted to the DB yet) so the
+  // Approve cards survive the refresh. Without this, the loader data wipes them
+  // and the Approve button disappears immediately after it should appear.
   useEffect(() => {
-    if (fetcher.data?.messages) setMessages(fetcher.data.messages);
+    if (!fetcher.data?.messages) return;
+    setMessages((current) => {
+      const fresh = fetcher.data!.messages!;
+      // Index fresh DB messages by content so we can match optimistic rows.
+      const byContent = new Map<string, Message>();
+      for (const m of fresh) byContent.set(m.content, m);
+      const merged: Message[] = [];
+      const seenContents = new Set<string>();
+      for (const m of current) {
+        const dbMatch = byContent.get(m.content);
+        if (dbMatch) {
+          // DB row exists for this content. Preserve any pendingWrites the
+          // optimistic version had (DB does not persist them).
+          merged.push({ ...dbMatch, pendingWrites: m.pendingWrites ?? dbMatch.pendingWrites });
+          seenContents.add(m.content);
+        } else if (m.id.startsWith("u-") || m.id.startsWith("a-")) {
+          // Pure optimistic row (not yet in DB). Keep it as-is.
+          merged.push(m);
+          seenContents.add(m.content);
+        }
+      }
+      // Append any DB rows that arrived after our optimistic tail (e.g. an
+      // assistant message whose persist completed but whose optimistic copy
+      // was already replaced).
+      for (const m of fresh) {
+        if (!seenContents.has(m.content)) merged.push(m);
+      }
+      return merged;
+    });
   }, [fetcher.data]);
 
   // Listen for the "reeve:stub" events dispatched by the alert-card buttons.
