@@ -484,70 +484,148 @@ function MessageRow({ msg, resolveWrite }: { msg: Message; resolveWrite: (params
 function ReasoningChip({ reasoning, elapsedMs }: { reasoning: string; elapsedMs?: number | null }) {
   const [open, setOpen] = useState(false);
   const seconds = elapsedMs != null ? Math.max(1, Math.round(elapsedMs / 1000)) : null;
-  const label = seconds != null ? `Thought for ${seconds}s` : "Reasoning";
+  const title = seconds != null ? `Thought for ${seconds}s` : "Thought Process";
   const steps = parseReasoningSteps(reasoning);
+
+  const btnStyle: React.CSSProperties = {
+    display: "inline-flex", alignItems: "center", gap: "8px",
+    border: "none", background: "transparent", cursor: "pointer",
+    fontFamily: "inherit", fontSize: "13px", color: C.textMuted,
+    padding: "4px 0", userSelect: "none",
+    transition: "color 0.15s ease",
+  };
+
   return (
-    <div style={{ marginBottom: "10px" }}>
+    <div style={{ marginBottom: "12px" }}>
       <button
-        onClick={() => setOpen((o) => !o)}
-        style={{
-          display: "inline-flex", alignItems: "center", gap: "6px",
-          border: "none", background: "transparent", cursor: "pointer",
-          fontFamily: "inherit", fontSize: "12px", fontWeight: 500, color: C.textMuted,
-          padding: "4px 0", userSelect: "none",
-        }}
+        type="button"
+        onClick={() => setOpen((v) => !v)}
+        aria-expanded={open}
+        style={btnStyle}
+        onMouseEnter={(e) => (e.currentTarget.style.color = C.textPrimary)}
+        onMouseLeave={(e) => (e.currentTarget.style.color = C.textMuted)}
       >
-        <span style={{ fontSize: "12px", lineHeight: 1, transform: open ? "rotate(90deg)" : "none", transition: "transform 0.15s ease", display: "inline-block" }}>{">"}</span>
-        <span>{label}</span>
+        <BrainIcon size={16} />
+        <span>{title}</span>
+        <ChevronDownIcon size={14} open={open} />
       </button>
+
       {open && (
-        <div
-          role="region"
-          style={{
-            marginTop: "8px", padding: "14px 16px",
+        steps.length > 0 ? (
+          <ol style={{
+            marginTop: "10px", marginBottom: 0, paddingLeft: "16px", listStyle: "none",
+            borderLeft: `1px solid ${C.border}`, marginLeft: "6px",
+            display: "flex", flexDirection: "column", gap: "8px",
+            fontSize: "13px", lineHeight: 1.6, color: C.textMuted,
+          }}>
+            {steps.map((step, i) => (
+              <li key={i}>
+                <span>
+                  {i + 1}.{" "}
+                  {step.label && <span style={{ fontWeight: 600, color: C.textPrimary }}>{step.label}</span>}
+                  {step.label && step.detail ? ": " : ""}
+                  {step.detail}
+                </span>
+                {step.children && step.children.length > 0 && (
+                  <ul style={{
+                    marginTop: "4px", marginLeft: "16px", paddingLeft: "16px",
+                    listStyleType: "disc",
+                  }}>
+                    {step.children.map((child, j) => (
+                      <li key={j} style={{ color: C.textMuted }}>{child}</li>
+                    ))}
+                  </ul>
+                )}
+              </li>
+            ))}
+          </ol>
+        ) : (
+          // Legacy / unparseable reasoning: render raw preformatted.
+          <pre style={{
+            marginTop: "10px", padding: "12px 14px",
             background: C.surface2, border: `1px solid ${C.border}`, borderRadius: "10px",
-            boxShadow: "0 1px 3px rgba(60,64,67,0.06)",
-          }}
-        >
-          {steps.length > 0 ? (
-            <ol style={{ listStyle: "none", margin: 0, padding: 0, display: "flex", flexDirection: "column", gap: "8px" }}>
-              {steps.map((s, i) => (
-                <li key={i} style={{
-                  display: "flex", gap: "10px", alignItems: "baseline",
-                  fontFamily: 'ui-monospace, "SF Mono", Menlo, Monaco, "Cascadia Code", monospace',
-                  fontSize: "12.5px", lineHeight: 1.55, color: C.textPrimary,
-                }}>
-                  <span style={{ color: C.textMuted, flexShrink: 0, minWidth: "18px", textAlign: "right" }}>{s.n}.</span>
-                  <span style={{ whiteSpace: "pre-wrap", wordBreak: "break-word" }}>{s.text}</span>
-                </li>
-              ))}
-            </ol>
-          ) : (
-            <pre style={{
-              margin: 0, whiteSpace: "pre-wrap", wordBreak: "break-word",
-              fontFamily: 'ui-monospace, "SF Mono", Menlo, Monaco, "Cascadia Code", monospace',
-              fontSize: "12.5px", lineHeight: 1.55, color: C.textMuted,
-            }}>{reasoning}</pre>
-          )}
-        </div>
+            margin: 0, whiteSpace: "pre-wrap", wordBreak: "break-word",
+            fontFamily: 'ui-monospace, "SF Mono", Menlo, monospace',
+            fontSize: "12.5px", lineHeight: 1.55, color: C.textMuted,
+          }}>{reasoning}</pre>
+        )
       )}
     </div>
   );
 }
 
-/** Parse a reasoning string (assumed ". numbered, one step per line") into steps.
- *  Tolerates plain prose/legacy formats by returning []. */
-function parseReasoningSteps(reasoning: string): { n: string; text: string }[] {
+/** Parse the reasoning string into structured steps with optional children.
+ *
+ *  Expected format (produced by the askLlm prompt):
+ *    1. Analyze Input — parsing the merchant question
+ *    2. Plan Tool Calls — call get_low_stock_products
+ *    - Filter by inventory_quantity <= threshold
+ *    - Sort ascending
+ *
+ *  Each top-level numbered line becomes a step. Lines starting with "-" or "*"
+ *  that follow a step attach as children of the most recent step. Unnumbered
+ *  text falls back to a single step whose label is empty and detail is the line.
+ *  Returns [] when the input is empty or no lines are present.
+ */
+function parseReasoningSteps(reasoning: string): { label: string; detail: string; children?: string[] }[] {
   const lines = reasoning.split(/\r?\n/).map((l) => l.trim()).filter(Boolean);
   if (!lines.length) return [];
-  // Each step should look like "1. Analyze Input — parsing the user greeting"
-  const steps: { n: string; text: string }[] = [];
+
+  const steps: { label: string; detail: string; children?: string[] }[] = [];
   for (const line of lines) {
-    const m = line.match(/^(\d{1,2})\.?\s+(.+)$/);
-    if (m) steps.push({ n: m[1], text: m[2].trim() });
+    const childMatch = line.match(/^[-*]\s+(.+)$/);
+    if (childMatch && steps.length > 0) {
+      const last = steps[steps.length - 1];
+      if (!last.children) last.children = [];
+      last.children.push(childMatch[1].trim());
+      continue;
+    }
+
+    // Try "N. Label - detail" or "N. Label — detail" (em or plain dash).
+    const stepMatch = line.match(/^\d{1,2}\.\s+(.+)$/);
+    if (stepMatch) {
+      const rest = stepMatch[1];
+      // Split on em-dash, en-dash, or " - " (but not hyphens inside words).
+      const parts = rest.split(/\s+[\u2014\u2013-]\s+/);
+      if (parts.length >= 2) {
+        steps.push({ label: parts[0].trim(), detail: parts.slice(1).join(" - ").trim() });
+      } else {
+        // No dash separator: treat whole thing as detail with no label.
+        steps.push({ label: "", detail: rest.trim() });
+      }
+      continue;
+    }
+
+    // Unnumbered, non-child line: attach as detail to a new step (no label).
+    steps.push({ label: "", detail: line });
   }
-  // If none of the lines look numbered, fall back to [] so the caller renders raw.
   return steps;
+}
+
+/** Inline Brain icon (avoids adding lucide-react as a dependency). */
+function BrainIcon({ size = 16 }: { size?: number }) {
+  return (
+    <svg width={size} height={size} viewBox="0 0 24 24" fill="none" stroke="currentColor"
+      strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden style={{ display: "block", flexShrink: 0 }}>
+      <path d="M12 5a3 3 0 1 0-5.997.125 4 4 0 0 0-2.526 5.77 4 4 0 0 0 .556 6.588A4 4 0 1 0 12 18Z" />
+      <path d="M12 5a3 3 0 1 1 5.997.125 4 4 0 0 1 2.526 5.77 4 4 0 0 1-.556 6.588A4 4 0 1 1 12 18Z" />
+    </svg>
+  );
+}
+
+/** Inline chevron-down icon with rotation when open (matches lucide-react). */
+function ChevronDownIcon({ size = 14, open }: { size?: number; open: boolean }) {
+  return (
+    <svg width={size} height={size} viewBox="0 0 24 24" fill="none" stroke="currentColor"
+      strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden
+      style={{
+        display: "block", flexShrink: 0,
+        transform: open ? "rotate(180deg)" : "none",
+        transition: "transform 0.2s ease",
+      }}>
+      <path d="m6 9 6 6 6-6" />
+    </svg>
+  );
 }
 
 type AlertRow = { id: string; title: string; status: string; minInventory: number; variants: { id: string; inventory: number | null }[] };
