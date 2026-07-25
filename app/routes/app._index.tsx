@@ -36,7 +36,7 @@ const CONTENT_MAX = 720; // px — Gemini's content width feel
 // ─── Loader (unchanged) ──────────────────────────────────────────────────────
 
 interface InventorySummary { total: number; inStock: number; lowStock: number; outOfStock: number; topLow: { id: string; title: string; inventory: number }[] }
-interface ChatAction { name: string; summary: string; ok: boolean; error?: string }
+interface ChatAction { name: string; summary: string; ok: boolean; error?: string; result?: unknown }
 interface Message {
   id: string;
   role: string;
@@ -119,6 +119,18 @@ export default function ReeveChat() {
     if (fetcher.data?.messages) setMessages(fetcher.data.messages);
   }, [fetcher.data]);
 
+  // Listen for the "reeve:stub" events dispatched by the alert-card buttons.
+  // Until those buttons get real handlers in the conversations commit, give
+  // the user honest feedback ("coming soon") instead of letting them look dead.
+  useEffect(() => {
+    const handler = (e: Event) => {
+      const detail = (e as CustomEvent<string>).detail;
+      shopify.toast.show(`${detail}: coming soon`, { duration: 2500 });
+    };
+    window.addEventListener("reeve:stub", handler as EventListener);
+    return () => window.removeEventListener("reeve:stub", handler as EventListener);
+  }, [shopify]);
+
   useEffect(() => {
     scrollRef.current?.scrollTo({ top: scrollRef.current.scrollHeight, behavior: "smooth" });
   }, [messages, chatFetcher.state]);
@@ -186,13 +198,7 @@ export default function ReeveChat() {
           <>
             {messages.map((m) => <MessageRow key={m.id} msg={m} />)}
             {isThinking && (
-              <div style={{ display: "flex", gap: "12px", alignItems: "center", padding: "10px 0 12px" }}>
-                <ReeveThinkingIcon size={36} />
-                <span style={{ fontSize: "13px", color: C.textMuted, fontWeight: 500 }}>Thinking</span>
-                <span style={thinkingDot(0)} />
-                <span style={thinkingDot(1)} />
-                <span style={thinkingDot(2)} />
-              </div>
+              <ThinkingRow />
             )}
           </>
         )}
@@ -217,7 +223,7 @@ export default function ReeveChat() {
                 send(input);
               }
             }}
-            placeholder="Ask Reeve about your inventory…  (Enter to send, Shift+Enter for newline)"
+            placeholder={composerPlaceholder({ summary, messages, isThinking })}
             rows={1}
             style={{
               flex: 1, resize: "none", border: "none", background: "transparent",
@@ -248,10 +254,10 @@ function WelcomeHome({ summary, onPick, disabled }: { summary: InventorySummary;
   return (
     <div style={{ minHeight: "100%", display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center", padding: "32px 0", textAlign: "center" }}>
       <h1 style={{ fontSize: "40px", fontWeight: 500, letterSpacing: "-0.02em", color: C.textPrimary, margin: "0 0 12px" }}>
-        Hello, Omar
+        {greetingHeadline(summary)}
       </h1>
-      <p style={{ fontSize: "16px", color: C.textMuted, margin: "0 0 32px", maxWidth: "440px" }}>
-        Ask Reeve about your inventory — what's low, restock, update prices, or mark products unavailable.
+      <p style={{ fontSize: "16px", color: C.textMuted, margin: "0 0 32px", maxWidth: "460px" }}>
+        {greetingSubline(summary)}
       </p>
 
       {summary.total > 0 && (
@@ -406,20 +412,136 @@ function parseReasoningSteps(reasoning: string): { n: string; text: string }[] {
   return steps;
 }
 
+type AlertRow = { id: string; title: string; status: string; minInventory: number; variants: { id: string; inventory: number | null }[] };
+
 function ActionCard({ action: a }: { action: ChatAction }) {
-  const color = a.ok ? C.accentBlue : C.dangerRed;
+  // The InventoryAlertCard is a richer renderer for one specific tool kind;
+  // other actions keep the compact summary row.
+  if (a.name === "get_low_stock_products" && Array.isArray(a.result) && a.result.length > 0) {
+    return <InventoryAlertCard action={a} rows={a.result as AlertRow[]} />;
+  }
+  return <CompactActionCard action={a} />;
+}
+
+function CompactActionCard({ action: a }: { action: ChatAction }) {
+  const { statusLabel, statusColor } = actionStatus(a);
   return (
     <div style={{
       border: `1px solid ${C.border}`, borderRadius: "8px",
-      padding: "8px 12px", background: C.bg, fontSize: "12px",
+      padding: "10px 12px", background: C.bg, fontSize: "12px",
     }}>
       <div style={{ display: "flex", alignItems: "center", gap: "8px" }}>
-        <span style={{ color, fontWeight: 700, fontSize: "13px" }}>{a.ok ? "✓" : "✗"}</span>
-        <span style={{ fontWeight: 500, color: C.textPrimary }}>{a.summary}</span>
+        <span style={{ color: a.ok ? C.accentBlue : C.dangerRed, fontWeight: 700, fontSize: "13px" }}>{a.ok ? "✓" : "✗"}</span>
+        <span style={{ fontWeight: 500, color: C.textPrimary, flex: 1 }}>{a.summary}</span>
+        {statusLabel && <StatusTag label={statusLabel} color={statusColor} />}
       </div>
       {a.error && <div style={{ color: C.dangerRed, marginTop: "3px", fontSize: "11px" }}>{a.error}</div>}
     </div>
   );
+}
+
+function InventoryAlertCard({ action: a, rows }: { action: ChatAction; rows: AlertRow[] }) {
+  const lateCount = rows.length;
+  return (
+    <div style={{
+      border: `1px solid ${C.border}`, borderRadius: "10px", background: C.bg,
+      boxShadow: "0 1px 3px rgba(60,64,67,0.06)", overflow: "hidden",
+    }}>
+      <div style={{
+        padding: "10px 14px", borderBottom: `1px solid ${C.border}`,
+        display: "flex", alignItems: "center", gap: "8px", background: C.surface2,
+      }}>
+        <span style={{ color: C.dangerRed, fontSize: "14px" }}>{"\u26A0"}</span>
+        <span style={{ fontWeight: 600, color: C.textPrimary, fontSize: "13px" }}>
+          Low Stock Alert: {lateCount} {lateCount === 1 ? "Product" : "Products"}
+        </span>
+      </div>
+      <div style={{ padding: "6px 0" }}>
+        <div style={{
+          display: "grid", gridTemplateColumns: "1fr 90px 110px",
+          padding: "6px 14px", fontSize: "10px", letterSpacing: "0.04em",
+          textTransform: "uppercase", color: C.textMuted, borderBottom: `1px solid ${C.border}`,
+        }}>
+          <span>Product</span>
+          <span style={{ textAlign: "right" }}>Stock</span>
+          <span style={{ textAlign: "right" }}>Product ID</span>
+        </div>
+        {rows.slice(0, 8).map((p) => {
+          const stock = p.minInventory;
+          const tone = stock <= 0 ? C.dangerRed : stock <= 2 ? "#B45309" : C.textPrimary;
+          const status = stock <= 0 ? "Out of stock" : stock <= 2 ? "Critical" : "Low";
+          return (
+            <div key={p.id} style={{
+              display: "grid", gridTemplateColumns: "1fr 90px 110px", alignItems: "center",
+              padding: "8px 14px", borderBottom: `1px solid ${C.border}`, fontSize: "12.5px",
+            }}>
+              <div style={{ display: "flex", flexDirection: "column", gap: "2px", minWidth: 0 }}>
+                <span style={{ fontWeight: 500, color: C.textPrimary, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{p.title}</span>
+                <span style={{ fontSize: "10px", color: C.textMuted }}>{status}</span>
+              </div>
+              <span style={{
+                textAlign: "right", fontWeight: 600, color: tone,
+                fontFamily: 'ui-monospace, "SF Mono", Menlo, monospace', fontSize: "13px",
+              }}>{stock}</span>
+              <span style={{
+                textAlign: "right", color: C.textMuted, fontSize: "10.5px",
+                fontFamily: 'ui-monospace, "SF Mono", Menlo, monospace',
+              }}>{p.id.split("/").pop()?.slice(-8)}</span>
+            </div>
+          );
+        })}
+        {rows.length > 8 && (
+          <div style={{ padding: "6px 14px", fontSize: "11px", color: C.textMuted }}>
+            + {rows.length - 8} more
+          </div>
+        )}
+      </div>
+      <div style={{ padding: "8px 14px", display: "flex", gap: "8px", flexWrap: "wrap", borderTop: `1px solid ${C.border}`, background: C.surface2 }}>
+        <CardButton label="View details" />
+        <CardButton label="Set auto-restock" />
+        <CardButton label="Export CSV" />
+      </div>
+    </div>
+  );
+}
+
+function CardButton({ label }: { label: string }) {
+  return (
+    <button
+      type="button"
+      onClick={() => {
+        // Stub: wired later with real actions in the conversations commit.
+        try { window.dispatchEvent(new CustomEvent("reeve:stub", { detail: label })); } catch { /* ignore */ }
+      }}
+      style={{
+        border: `1px solid ${C.border}`, background: C.bg, color: C.textPrimary,
+        borderRadius: "8px", padding: "5px 12px", fontSize: "12px", cursor: "pointer",
+        fontFamily: "inherit", fontWeight: 500,
+      }}
+    >
+      {label}
+    </button>
+  );
+}
+
+function StatusTag({ label, color }: { label: string; color: string }) {
+  return (
+    <span style={{
+      padding: "2px 7px", borderRadius: "999px", fontSize: "10px", fontWeight: 600,
+      background: color + "1A", color, letterSpacing: "0.02em", textTransform: "uppercase",
+    }}>{label}</span>
+  );
+}
+
+function actionStatus(a: ChatAction): { statusLabel: string | null; statusColor: string } {
+  // Color-coded micro-tags for common tool outcomes. Reserved strictly for data
+  // alerts — never used on the icon/avatar.
+  if (!a.ok) return { statusLabel: "Failed", statusColor: C.dangerRed };
+  if (a.name === "set_product_status" && /DRAFT/i.test(a.summary)) return { statusLabel: "Unavailable", statusColor: C.dangerRed };
+  if (a.name === "set_product_status" && /ACTIVE/i.test(a.summary)) return { statusLabel: "Active", statusColor: C.okGreen };
+  if (a.name === "update_inventory") return { statusLabel: "Restocked", statusColor: C.okGreen };
+  if (a.name === "update_price") return { statusLabel: "Price updated", statusColor: C.accentBlue };
+  return { statusLabel: null, statusColor: C.textMuted };
 }
 
 // ─── Composer pieces ────────────────────────────────────────────────────────
@@ -484,7 +606,89 @@ function thinkingDot(delay: number): React.CSSProperties {
   };
 }
 
-// ─── Reeve brand icon (rounded-square card + inverted R silhouette) ─────────
+// ─── Helpers: proactive greeting, dynamic placeholder, thinking row ──────────
+
+/** Proactive headline. Surfaces a real inventory insight instead of "Hello,
+ *  Omar" — what a co-pilot does on first open. */
+function greetingHeadline(summary: InventorySummary): string {
+  if (summary.outOfStock > 0) {
+    return `${summary.outOfStock} ${summary.outOfStock === 1 ? "product is" : "products are"} out of stock`;
+  }
+  if (summary.lowStock > 0) {
+    return `${summary.lowStock} ${summary.lowStock === 1 ? "product is" : "products are"} running low`;
+  }
+  if (summary.total === 0) {
+    return "Nothing to watch yet";
+  }
+  return `All ${summary.total} products are healthy`;
+}
+
+/** Proactive subline. Offers a concrete next action drawn from the summary. */
+function greetingSubline(summary: InventorySummary): string {
+  if (summary.outOfStock > 0 && summary.lowStock > 0) {
+    return `${summary.outOfStock} out-of-stock and ${summary.lowStock} low-stock items need attention. Want me to draft a restock report or mark the unavailable ones as DRAFT?`;
+  }
+  if (summary.outOfStock > 0) {
+    return `${summary.outOfStock} ${summary.outOfStock === 1 ? "item has" : "items have"} zero stock. I can mark them unavailable (DRAFT) so they stop showing in your store, or draft a restock order. Which would you like?`;
+  }
+  if (summary.lowStock > 0) {
+    return `${summary.lowStock} ${summary.lowStock === 1 ? "item is" : "items are"} at or below 5 units. Want me to generate a restock report for them?`;
+  }
+  if (summary.total === 0) {
+    return "Once you add products to this store I can watch stock levels, suggest restocks, and keep availability in sync. Try me by asking "What's running low?" after you add inventory.";
+  }
+  return "Your stock levels look good. Ask me to summarize inventory, show low-stock items, or update a price.";
+}
+
+/** Context-aware composer placeholder. Guides the next action based on the
+ *  most recent assistant turn or the loaded summary. */
+function composerPlaceholder({ summary, messages, isThinking }: { summary: InventorySummary; messages: Message[]; isThinking: boolean }): string {
+  if (isThinking) return "Reeve is working on it…";
+  const lastAssistant = [...messages].reverse().find((m) => m.role === "assistant");
+  if (lastAssistant && /low.?stock|out.?of.?stock|threshold/i.test(lastAssistant.content)) {
+    return "Ask Reeve to restock the low items, or mark unavailable…";
+  }
+  if (lastAssistant && /price|pricing|cost/i.test(lastAssistant.content)) {
+    return "Ask Reeve to update a price next…";
+  }
+  if (summary.outOfStock > 0) return "Ask Reeve to mark out-of-stock items unavailable…";
+  if (summary.lowStock > 0) return "Ask Reeve to reorder the low-stock items…";
+  if (summary.total === 0) return "Ask Reeve to summarize your inventory…";
+  return "Ask Reeve about your inventory…  (Enter to send, Shift+Enter for newline)";
+}
+
+/** Thinking row: shimmer icon + a cycling label that randomly rotates through
+ *  a pool of "cognitive stage" words. Replaces the static "Thinking" + dots,
+ *  which made the agent look slow + was dishonest about what was happening. */
+const THINKING_WORDS = [
+  "Thinking", "Brainstorming", "Condensing", "Considering", "Deliberating",
+  "Reflecting", "Reasoning", "Weighing", "Synthesizing", "Composing",
+];
+function ThinkingRow() {
+  const [word, setWord] = useState(THINKING_WORDS[0]);
+  useEffect(() => {
+    // Pick a random word every ~1.2s while mounted. Avoid showing the same
+    // word twice in a row so the change is perceptible.
+    const id = setInterval(() => {
+      setWord((prev) => {
+        const pool = THINKING_WORDS.filter((w) => w !== prev);
+        return pool[Math.floor(Math.random() * pool.length)];
+      });
+    }, 1200);
+    return () => clearInterval(id);
+  }, []);
+  return (
+    <div style={{ display: "flex", gap: "12px", alignItems: "center", padding: "10px 0 12px" }}>
+      <ReeveThinkingIcon size={36} />
+      <span
+        key={word}
+        style={{ fontSize: "13px", color: C.textMuted, fontWeight: 500, animation: "reeveFadeIn 0.4s ease" }}
+      >{word}…</span>
+    </div>
+  );
+}
+
+// ─── Reeve brand icon ─────────────────────────────────────────────────────────
 // Card color follows `cardColor`; the R silhouette stays white. Pass muted grey
 // while the agent is generating, full black once the reply has landed.
 function ReeveIcon({ cardColor = "#1F1F1F", size = 36 }: { cardColor?: string; size?: number }) {
@@ -527,7 +731,8 @@ export const links = () => [
     rel: "stylesheet",
     href: "data:text/css," + encodeURIComponent(
       "@keyframes reevePulse{0%,100%{opacity:0.25;transform:scale(0.85)}50%{opacity:0.9;transform:scale(1)}}" +
-      "@keyframes reeveSweep{0%{transform:translateX(-120%)}100%{transform:translateX(280%)}}",
+      "@keyframes reeveSweep{0%{transform:translateX(-120%)}100%{transform:translateX(280%)}}" +
+      "@keyframes reeveFadeIn{0%{opacity:0;transform:translateY(2px)}100%{opacity:1;transform:translateY(0)}}",
     ),
   },
 ];

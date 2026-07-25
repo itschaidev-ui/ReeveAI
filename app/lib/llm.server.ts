@@ -145,6 +145,7 @@ export async function askLlmAnswer(
     "- If tools succeeded, summarize the outcome. If a tool failed, tell the user what went wrong and suggest a next step.",
     "- Do NOT include the action-card summaries (the UI renders those separately). Just the answer prose.",
     "- Plain text only. No markdown, no emoji, no JSON.",
+    '- If the user asked for something outside your tool scope (e.g. physically shipping items, billing, marketing, refunds), say so honestly and guide them to the right place in Shopify admin (e.g. Settings > Billing, Orders > Refunds, etc). Never silently fail — escalate.',
     "",
     "Plan reasoning (your own thinking step):",
     reasoning || "(none)",
