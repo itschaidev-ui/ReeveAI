@@ -35,22 +35,42 @@ model Session {
 
 // ─── Reeve AI models ──────────────────────────────────────────────────────────
 
+/// A conversation (chat thread) between the merchant and the Reeve agent.
+/// ChatMessages belong to exactly one Conversation via conversationId.
+/// Legacy messages (created before this model existed) have conversationId = null
+/// and are excluded from the sidebar; the home screen always shows a fresh chat.
+model Conversation {
+  id        String   @id @default(cuid())
+  shop      String
+  title     String
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([shop, updatedAt])
+}
+
 /// One message in a conversation between the merchant and the Reeve agent.
 model ChatMessage {
-  id           String   @id @default(cuid())
-  shop         String
-  role         String // user | assistant
-  content      String
+  id              String   @id @default(cuid())
+  shop            String
+  /// Which conversation this message belongs to. Null for legacy rows created
+  /// before the Conversation model existed; the UI treats null as "not in any
+  /// sidebar chat" and never surfaces them.
+  conversationId  String?
+  role            String // user | assistant
+  content         String
   /// The model's short reasoning shown in the collapsible "Thinking…" chip.
   /// Null for legacy rows (rendered without the chip) and for user messages.
-  reasoning    String?
+  reasoning       String?
   /// Wall-clock ms the agent took (planning + tools). Null for legacy rows.
-  elapsedMs    Int?
+  elapsedMs       Int?
   /// JSON: [{name, args, result, summary, ok}] — the agent's tool calls, rendered as action cards.
-  actionsJson  String?
-  createdAt    DateTime @default(now())
+  actionsJson     String?
+  createdAt       DateTime @default(now())
 
   @@index([shop, createdAt])
+  @@index([conversationId, createdAt])
+}
 }
 
 /// Immutable audit-trail row. Every agent write appends one with before/after.

@@ -47,16 +47,32 @@ export async function runAgent(params: {
   admin: AdminClient;
   shop: string;
   message: string;
+  conversationId: string;
   effort?: ReasoningEffort;
 }): Promise<AgentResponse> {
-  const { admin, shop, message } = params;
+  const { admin, shop, message, conversationId } = params;
   const effort: ReasoningEffort = params.effort ?? "medium";
   const ctx: ToolCtx = { admin, shop };
   const startedAt = Date.now();
 
-  // 1. Load recent history (last 10 turns) for context.
+  // 0. Auto-title: the first user message in a conversation with the default
+  //    title ("New chat") becomes the title (first ~60 chars of the message).
+  //    This runs BEFORE we persist the new user message so the sidebar updates
+  //    immediately when a fresh chat gets its first reply.
+  const conv = await prisma.conversation.findUnique({ where: { id: conversationId } });
+  if (conv && conv.title === "New chat") {
+    const existingUserMsgs = await prisma.chatMessage.count({
+      where: { conversationId, role: "user" },
+    });
+    if (existingUserMsgs === 0) {
+      const title = message.trim().slice(0, 60) + (message.trim().length > 60 ? "…" : "");
+      await prisma.conversation.update({ where: { id: conversationId }, data: { title } });
+    }
+  }
+
+  // 1. Load recent history scoped to THIS conversation (last 10 turns).
   const recent = await prisma.chatMessage.findMany({
-    where: { shop },
+    where: { conversationId },
     orderBy: { createdAt: "desc" },
     take: 10,
   });
@@ -192,11 +208,14 @@ export async function runAgent(params: {
     response = "I wasn\'t able to propose any writes this turn — I can show you the relevant products, but to actually change one I\'ll need you to ask about a specific product by name. Which product would you like me to update, and to what?";
   }
 
-  // 5. Persist + audit.
-  await prisma.chatMessage.create({ data: { shop, role: "user", content: message } });
+  // 5. Persist + audit. Both messages carry the conversationId so the loader
+  //    can scope by conversation. Bump the conversation's updatedAt so the
+  //    sidebar ordering reflects the most-recently-active chat.
+  await prisma.chatMessage.create({ data: { shop, conversationId, role: "user", content: message } });
   await prisma.chatMessage.create({
     data: {
       shop,
+      conversationId,
       role: "assistant",
       content: response,
       reasoning: reasoning || null,
@@ -204,6 +223,10 @@ export async function runAgent(params: {
       actionsJson: JSON.stringify(actions),
     },
   });
+  await prisma.conversation.update({
+    where: { id: conversationId },
+    data: { updatedAt: new Date() },
+  }).catch(() => { /* conversation may have been deleted mid-run; ignore */ });
   await logActivity({
     shop,
     type: "agent_message",

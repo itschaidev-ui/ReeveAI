@@ -60,10 +60,20 @@ interface Message {
   elapsedMs?: number | null; // assistant only; null for user + legacy rows
   pendingWrites?: PendingWrite[]; // assistant only; transient (not persisted yet)
 }
-interface LoaderData { summary: InventorySummary; messages: Message[]; provider: "nvidia" | "demo" }
+interface ConversationSummary { id: string; title: string; updatedAt: string }
+interface LoaderData {
+  summary: InventorySummary;
+  messages: Message[];
+  conversations: ConversationSummary[];
+  activeConversationId: string | null;
+  provider: "nvidia" | "demo";
+}
 
 /** Shape returned by POST /app/chat — used by the optimistic assistant-reply effect. */
 interface ChatResult { response?: string; reasoning?: string | null; actions?: ChatAction[]; elapsedMs?: number | null; pendingWrites?: PendingWrite[]; error?: string }
+
+/** Shape returned by the /app/conversations resource route. */
+interface ConversationResult { conversation?: ConversationSummary; ok?: boolean; error?: string }
 
 export const loader = async ({ request }: LoaderFunctionArgs): Promise<LoaderData> => {
   const { admin, session } = await authenticate.admin(request);
@@ -92,16 +102,46 @@ export const loader = async ({ request }: LoaderFunctionArgs): Promise<LoaderDat
   }
   lowList.sort((a, b) => a.inventory - b.inventory);
 
-  const dbMessages = await prisma.chatMessage.findMany({ where: { shop }, orderBy: { createdAt: "desc" }, take: 30 });
+  // ── Conversations ─────────────────────────────────────────────────────────
+  // Sidebar list (most-recently-updated first). We always load the full list so
+  // the sidebar works on first paint; the active one is chosen client-side.
+  const conversations = await prisma.conversation.findMany({
+    where: { shop },
+    orderBy: { updatedAt: "desc" },
+    take: 100,
+  });
 
-  return {
-    summary: { total, inStock, lowStock, outOfStock, topLow: lowList.slice(0, 5) },
-    messages: dbMessages.reverse().map((m) => ({
+  // Pick the active conversation. Preference order:
+  //   1. ?c=<id> query param (explicit switch from the sidebar)
+  //   2. most-recently-updated (so reload lands you back where you were)
+  //   3. null → homepage empty state
+  const url = new URL(request.url);
+  const requestedId = url.searchParams.get("c");
+  const active = (requestedId && conversations.find((c) => c.id === requestedId)) || conversations[0] || null;
+  const activeConversationId = active?.id ?? null;
+
+  // Load messages ONLY for the active conversation. Other conversations' msgs
+  // are fetched on-demand by switching (which re-runs the loader via ?c=).
+  let messages: Message[] = [];
+  if (active) {
+    const dbMessages = await prisma.chatMessage.findMany({
+      where: { conversationId: active.id, shop },
+      orderBy: { createdAt: "desc" },
+      take: 60,
+    });
+    messages = dbMessages.reverse().map((m) => ({
       id: m.id, role: m.role, content: m.content,
       reasoning: m.reasoning ?? null,
       elapsedMs: m.elapsedMs ?? null,
       actions: m.actionsJson ? (JSON.parse(m.actionsJson) as ChatAction[]) : null,
-    })),
+    }));
+  }
+
+  return {
+    summary: { total, inStock, lowStock, outOfStock, topLow: lowList.slice(0, 5) },
+    messages,
+    conversations: conversations.map((c) => ({ id: c.id, title: c.title, updatedAt: c.updatedAt.toISOString() })),
+    activeConversationId,
     provider: process.env.NVIDIA_API_KEY ? "nvidia" : "demo",
   };
 };
@@ -109,15 +149,21 @@ export const loader = async ({ request }: LoaderFunctionArgs): Promise<LoaderDat
 // ─── Full-page chat ─────────────────────────────────────────────────────────
 
 export default function ReeveChat() {
-  const { summary, messages: initialMessages, provider } = useLoaderData<typeof loader>();
+  const { summary, messages: initialMessages, conversations: initialConversations, activeConversationId: initialActive, provider } = useLoaderData<typeof loader>();
   const fetcher = useFetcher<typeof loader>();
   const chatFetcher = useFetcher<ChatResult>();
   const approveFetcher = useFetcher<{ action?: ChatAction; error?: string }>();
+  const convFetcher = useFetcher<ConversationResult>();
   const shopify = useAppBridge();
 
   const [messages, setMessages] = useState<Message[]>(initialMessages);
+  const [conversations, setConversations] = useState<ConversationSummary[]>(initialConversations);
+  const [activeConversationId, setActiveConversationId] = useState<string | null>(initialActive);
   const [input, setInput] = useState("");
   const [effort, setEffort] = useState<ReasoningEffort>("medium");
+  const [sidebarOpen, setSidebarOpen] = useState(false);
+  const [renamingId, setRenamingId] = useState<string | null>(null);
+  const [renameValue, setRenameValue] = useState("");
   const scrollRef = useRef<HTMLDivElement>(null);
   const lastReplyRef = useRef<string | null>(null);
 
@@ -131,13 +177,51 @@ export default function ReeveChat() {
     try { localStorage.setItem("reeve.effort", effort); } catch { /* ignore */ }
   }, [effort]);
 
+  // ── Conversation list sync ────────────────────────────────────────────────
+  // When the loader refreshes (after a reply, after create/rename/delete), pull
+  // the fresh conversation list + active id into local state. We deliberately do
+  // NOT touch `messages` here for conversation switches — that's handled by the
+  // dedicated switch effect below to avoid clobbering optimistic rows mid-send.
+  useEffect(() => {
+    if (!fetcher.data) return;
+    if (fetcher.data.conversations) setConversations(fetcher.data.conversations);
+    // Only adopt the loader's active id if we're not mid-flight on a chat send
+    // (the send itself owns the active id until the reply lands).
+    if (!chatFetcher.state || chatFetcher.state === "idle") {
+      if (fetcher.data.activeConversationId !== undefined) {
+        setActiveConversationId(fetcher.data.activeConversationId);
+      }
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [fetcher.data]);
+
+  // ── Conversation SWITCH ───────────────────────────────────────────────────
+  // When the active conversation changes (sidebar click or new chat), REPLACE
+  // messages from the loader. This is the one place we intentionally overwrite
+  // rather than merge — switching chats is a clean cut.
+  const lastSwitchedId = useRef<string | null>(initialActive);
+  useEffect(() => {
+    if (!fetcher.data) return;
+    if (fetcher.data.activeConversationId === undefined) return;
+    if (fetcher.data.activeConversationId === lastSwitchedId.current) return;
+    lastSwitchedId.current = fetcher.data.activeConversationId;
+    setMessages(fetcher.data.messages ?? []);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [fetcher.data?.activeConversationId]);
+
   // When the loader refreshes (after a reply lands), MERGE its DB-persisted
   // messages with our in-flight optimistic state instead of blindly replacing.
   // This preserves pendingWrites (which are NOT persisted to the DB yet) so the
   // Approve cards survive the refresh. Without this, the loader data wipes them
   // and the Approve button disappears immediately after it should appear.
+  //
+  // SKIP when the active conversation just switched (the switch effect already
+  // did a clean replace) — otherwise the two effects race on the same data tick.
+  const mergedThisTick = useRef(false);
   useEffect(() => {
     if (!fetcher.data?.messages) return;
+    if (fetcher.data.activeConversationId !== lastSwitchedId.current) return; // switch is handling it
+    mergedThisTick.current = true;
     setMessages((current) => {
       const fresh = fetcher.data!.messages!;
       // Index fresh DB messages by content so we can match optimistic rows.
@@ -273,7 +357,110 @@ export default function ReeveChat() {
     setMessages((m) => [...m, { id: `u-${Date.now()}`, role: "user", content: trimmed }]);
     setInput("");
     lastReplyRef.current = null;
-    chatFetcher.submit({ message: trimmed, effort }, { method: "POST", action: "/app/chat", encType: "application/json" });
+
+    // Conversation contract: every send needs a conversationId. If we don't
+    // have one yet (fresh homepage), create one optimistically then submit the
+    // chat. If we already have one, send straight away.
+    if (!activeConversationId) {
+      // Create conversation first, then send the message against it. We hold
+      // the pending message in a ref so the convFetcher result effect can fire
+      // the actual chat submit once we have an id.
+      pendingSendRef.current = { message: trimmed, effort };
+      convFetcher.submit({}, { method: "POST", action: "/app/conversations", encType: "application/json" });
+      return;
+    }
+    chatFetcher.submit(
+      { message: trimmed, conversationId: activeConversationId, effort },
+      { method: "POST", action: "/app/chat", encType: "application/json" },
+    );
+  };
+
+  // Holds a send that's waiting on conversation creation to fire. Cleared once
+  // the conversation exists and the chat submit goes out.
+  const pendingSendRef = useRef<{ message: string; effort: ReasoningEffort } | null>(null);
+
+  // Drain convFetcher (create/rename/delete) results back into local state.
+  useEffect(() => {
+    if (convFetcher.state !== "idle" || !convFetcher.data) return;
+    const data = convFetcher.data;
+    // Create result → new conversation prepended to sidebar + becomes active.
+    // If we were holding a pending send, fire it now against the new id.
+    if (data.conversation) {
+      setConversations((prev) => {
+        const without = prev.filter((c) => c.id !== data.conversation!.id);
+        return [data.conversation!, ...without];
+      });
+      setActiveConversationId(data.conversation.id);
+      lastSwitchedId.current = data.conversation.id;
+      if (pendingSendRef.current) {
+        const { message, effort: eff } = pendingSendRef.current;
+        pendingSendRef.current = null;
+        chatFetcher.submit(
+          { message, conversationId: data.conversation.id, effort: eff },
+          { method: "POST", action: "/app/chat", encType: "application/json" },
+        );
+      } else {
+        // Pure "New chat" click (no pending send): clear the message pane.
+        setMessages([]);
+      }
+    }
+    if (data.error) shopify.toast.show(data.error, { isError: true });
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [convFetcher.data, convFetcher.state]);
+
+  /** Sidebar actions. Each is a thin wrapper around convFetcher / navigation
+   *  so the sidebar stays declarative and doesn't need its own state. */
+  const handleNewChat = () => {
+    if (convFetcher.state !== "idle") return;
+    pendingSendRef.current = null;
+    convFetcher.submit({}, { method: "POST", action: "/app/conversations", encType: "application/json" });
+  };
+
+  const handleSelectChat = (id: string) => {
+    if (id === activeConversationId) { setSidebarOpen(false); return; }
+    // Re-run the loader scoped to the selected conversation. The switch effect
+    // picks up the new messages + active id when it lands.
+    setSidebarOpen(false);
+    fetcher.load(`/app?c=${encodeURIComponent(id)}`);
+  };
+
+  const startRename = (id: string, currentTitle: string) => {
+    setRenamingId(id);
+    setRenameValue(currentTitle);
+  };
+  const commitRename = (id: string) => {
+    const title = renameValue.trim();
+    setRenamingId(null);
+    if (!title) return;
+    // Optimistic local update + fire the PATCH.
+    setConversations((prev) => prev.map((c) => (c.id === id ? { ...c, title } : c)));
+    convFetcher.submit(
+      { id, title },
+      { method: "PATCH", action: "/app/conversations", encType: "application/json" },
+    );
+  };
+
+  const handleDelete = (id: string, title: string) => {
+    // Native confirm — App Bridge's confirm modal needs more plumbing; this is
+    // good enough for a debug/test feature and the action is reversible only by
+    // re-typing, so we want the explicit gate.
+    if (!window.confirm(`Delete "${title}"? This removes the chat and all its messages.`)) return;
+    // Optimistic removal from sidebar + clear pane if it was active.
+    setConversations((prev) => prev.filter((c) => c.id !== id));
+    if (id === activeConversationId) {
+      setActiveConversationId(null);
+      setMessages([]);
+      lastSwitchedId.current = null;
+    }
+    convFetcher.submit(
+      { id },
+      { method: "DELETE", action: "/app/conversations", encType: "application/json" },
+    );
+  };
+
+  const handleExport = (id: string) => {
+    // Direct navigation triggers the loader's Content-Disposition: attachment.
+    window.open(`/app/conversations/export?id=${encodeURIComponent(id)}`, "_blank");
   };
 
   useEffect(() => {
@@ -304,8 +491,46 @@ export default function ReeveChat() {
   return (
     <div style={{ position: "relative", display: "flex", flexDirection: "column", height: "100vh", maxHeight: "100vh", background: C.bg, fontFamily: '"Inter", system-ui, -apple-system, sans-serif' }}>
 
+      {/* ─── Sidebar (collapsible overlay, ChatGPT-style) ─── */}
+      <Sidebar
+        open={sidebarOpen}
+        conversations={conversations}
+        activeId={activeConversationId}
+        renamingId={renamingId}
+        renameValue={renameValue}
+        onRenameValueChange={setRenameValue}
+        onClose={() => setSidebarOpen(false)}
+        onNew={handleNewChat}
+        onSelect={handleSelectChat}
+        onStartRename={startRename}
+        onCommitRename={commitRename}
+        onCancelRename={() => setRenamingId(null)}
+        onDelete={handleDelete}
+        onExport={handleExport}
+        busy={convFetcher.state !== "idle"}
+      />
+
       {/* ─── Corner pill (replaces header bar) ─── */}
       <div style={{ position: "absolute", top: "14px", left: "20px", right: "20px", display: "flex", alignItems: "center", gap: "10px", zIndex: 5 }}>
+        {/* Sidebar toggle (hamburger). Sits at the far left so it's reachable
+            even when the corner pill text is long. */}
+        <button
+          type="button"
+          onClick={() => setSidebarOpen((v) => !v)}
+          aria-label={sidebarOpen ? "Close chat list" : "Open chat list"}
+          style={{
+            display: "inline-flex", alignItems: "center", justifyContent: "center",
+            width: "34px", height: "34px", borderRadius: "8px",
+            border: "none", background: "transparent", cursor: "pointer",
+            color: C.textMuted, fontFamily: "inherit",
+          }}
+          onMouseEnter={(e) => { e.currentTarget.style.background = C.surface; e.currentTarget.style.color = C.textPrimary; }}
+          onMouseLeave={(e) => { e.currentTarget.style.background = "transparent"; e.currentTarget.style.color = C.textMuted; }}
+        >
+          <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" aria-hidden>
+            <path d="M3 6h18M3 12h18M3 18h18" />
+          </svg>
+        </button>
         <span style={{ fontSize: "15px", fontWeight: 500, color: C.textPrimary, letterSpacing: "-0.01em" }}>Reeve</span>
         <span style={{
           display: "inline-flex", alignItems: "center", gap: "5px",
@@ -380,6 +605,218 @@ const SUGGESTIONS = [
   { label: "Show my products", message: "Show me my products" },
   { label: "Mark out-of-stock unavailable", message: "Find out-of-stock items and mark them as DRAFT/unavailable" },
 ];
+
+// ─── Sidebar (chat list) ────────────────────────────────────────────────────
+//
+// Collapsible left overlay, ChatGPT-style. Slides in over the chat when open;
+// a scrim behind it closes on click. Each row shows the conversation title and
+// a small hover-revealed toolbar (rename, export, delete). New chat button at
+// the top. Empty state explains the flow.
+
+function Sidebar({
+  open, conversations, activeId, renamingId, renameValue,
+  onRenameValueChange, onClose, onNew, onSelect, onStartRename, onCommitRename, onCancelRename,
+  onDelete, onExport, busy,
+}: {
+  open: boolean;
+  conversations: ConversationSummary[];
+  activeId: string | null;
+  renamingId: string | null;
+  renameValue: string;
+  onRenameValueChange: (v: string) => void;
+  onClose: () => void;
+  onNew: () => void;
+  onSelect: (id: string) => void;
+  onStartRename: (id: string, title: string) => void;
+  onCommitRename: (id: string) => void;
+  onCancelRename: () => void;
+  onDelete: (id: string, title: string) => void;
+  onExport: (id: string) => void;
+  busy: boolean;
+}) {
+  return (
+    <>
+      {/* Scrim — click anywhere outside the panel to close. */}
+      {open && (
+        <div
+          onClick={onClose}
+          style={{ position: "fixed", inset: 0, background: "rgba(0,0,0,0.25)", zIndex: 20 }}
+        />
+      )}
+      {/* Panel. Width 280px. Slides via transform; transitions only when
+          toggling so initial mount doesn't animate. */}
+      <aside
+        style={{
+          position: "fixed", top: 0, left: 0, bottom: 0, width: "280px",
+          background: C.bg, borderRight: `1px solid ${C.border}`,
+          transform: open ? "translateX(0)" : "translateX(-100%)",
+          transition: "transform 0.18s ease",
+          zIndex: 21, display: "flex", flexDirection: "column",
+          boxShadow: open ? "2px 0 12px rgba(0,0,0,0.06)" : "none",
+          fontFamily: '"Inter", system-ui, -apple-system, sans-serif',
+        }}
+      >
+        {/* Header: New chat + close */}
+        <div style={{ padding: "14px 12px 10px", display: "flex", gap: "8px", alignItems: "center" }}>
+          <button
+            type="button"
+            onClick={onNew}
+            disabled={busy}
+            style={{
+              flex: 1, display: "inline-flex", alignItems: "center", justifyContent: "center", gap: "6px",
+              padding: "9px 12px", borderRadius: "10px",
+              border: `1px solid ${C.border}`, background: C.bg,
+              color: C.textPrimary, fontSize: "13px", fontWeight: 500, cursor: busy ? "default" : "pointer",
+              fontFamily: "inherit", opacity: busy ? 0.6 : 1,
+            }}
+          >
+            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" aria-hidden>
+              <path d="M12 5v14M5 12h14" />
+            </svg>
+            New chat
+          </button>
+          <button
+            type="button"
+            onClick={onClose}
+            aria-label="Close"
+            style={{
+              display: "inline-flex", alignItems: "center", justifyContent: "center",
+              width: "34px", height: "34px", borderRadius: "8px",
+              border: "none", background: "transparent", cursor: "pointer", color: C.textMuted, fontFamily: "inherit",
+            }}
+            onMouseEnter={(e) => { e.currentTarget.style.background = C.surface; }}
+            onMouseLeave={(e) => { e.currentTarget.style.background = "transparent"; }}
+          >
+            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" aria-hidden>
+              <path d="M18 6 6 18M6 6l12 12" />
+            </svg>
+          </button>
+        </div>
+
+        {/* List */}
+        <div style={{ flex: 1, overflowY: "auto", padding: "4px 8px 12px" }}>
+          {conversations.length === 0 ? (
+            <div style={{ padding: "20px 12px", color: C.textMuted, fontSize: "12.5px", lineHeight: 1.5 }}>
+              No chats yet. Send a message or click <strong>New chat</strong> to start one.
+            </div>
+          ) : (
+            conversations.map((c) => {
+              const isActive = c.id === activeId;
+              const isRenaming = renamingId === c.id;
+              return (
+                <div
+                  key={c.id}
+                  style={{
+                    display: "flex", alignItems: "center", gap: "4px",
+                    margin: "2px 0", padding: "0 4px",
+                    borderRadius: "8px",
+                    background: isActive ? C.surface : "transparent",
+                  }}
+                  onMouseEnter={(e) => { if (!isActive) e.currentTarget.style.background = C.surface2; }}
+                  onMouseLeave={(e) => { if (!isActive) e.currentTarget.style.background = "transparent"; }}
+                >
+                  {isRenaming ? (
+                    <input
+                      // eslint-disable-next-line jsx-a11y/no-autofocus
+                      autoFocus
+                      value={renameValue}
+                      onChange={(e) => onRenameValueChange(e.target.value)}
+                      onKeyDown={(e) => {
+                        if (e.key === "Enter") { e.preventDefault(); onCommitRename(c.id); }
+                        if (e.key === "Escape") { e.preventDefault(); onCancelRename(); }
+                      }}
+                      onBlur={() => onCommitRename(c.id)}
+                      style={{
+                        flex: 1, border: `1px solid ${C.accentBlue}`, borderRadius: "6px",
+                        padding: "6px 8px", fontSize: "13px", color: C.textPrimary,
+                        fontFamily: "inherit", outline: "none", background: C.bg,
+                        margin: "4px 0",
+                      }}
+                    />
+                  ) : (
+                    <button
+                      type="button"
+                      onClick={() => onSelect(c.id)}
+                      title={c.title}
+                      style={{
+                        flex: 1, textAlign: "left",
+                        border: "none", background: "transparent", cursor: "pointer",
+                        padding: "8px 8px", fontFamily: "inherit",
+                        fontSize: "13px", color: isActive ? C.textPrimary : C.textMuted,
+                        fontWeight: isActive ? 500 : 400,
+                        overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap",
+                      }}
+                    >
+                      {c.title || "Untitled chat"}
+                    </button>
+                  )}
+
+                  {/* Hover toolbar: rename, export, delete. Hidden while renaming. */}
+                  {!isRenaming && (
+                    <div style={{ display: "flex", gap: "0px", opacity: 1 }}>
+                      <SidebarIconBtn label="Rename" onClick={() => onStartRename(c.id, c.title)} disabled={busy}>
+                        <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden>
+                          <path d="M12 20h9" /><path d="M16.5 3.5a2.121 2.121 0 0 1 3 3L7 19l-4 1 1-4Z" />
+                        </svg>
+                      </SidebarIconBtn>
+                      <SidebarIconBtn label="Export JSON" onClick={() => onExport(c.id)}>
+                        <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden>
+                          <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4" /><path d="M7 10l5 5 5-5" /><path d="M12 15V3" />
+                        </svg>
+                      </SidebarIconBtn>
+                      <SidebarIconBtn label="Delete" onClick={() => onDelete(c.id, c.title)} disabled={busy} danger>
+                        <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden>
+                          <path d="M3 6h18" /><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2" />
+                        </svg>
+                      </SidebarIconBtn>
+                    </div>
+                  )}
+                </div>
+              );
+            })
+          )}
+        </div>
+
+        {/* Footer hint */}
+        <div style={{ padding: "10px 14px", borderTop: `1px solid ${C.border}`, fontSize: "11px", color: C.textMuted }}>
+          Chats are saved per store. Export for debug.
+        </div>
+      </aside>
+    </>
+  );
+}
+
+/** Tiny icon button used in the sidebar row hover toolbar. */
+function SidebarIconBtn({
+  children, label, onClick, disabled, danger,
+}: {
+  children: React.ReactNode;
+  label: string;
+  onClick: () => void;
+  disabled?: boolean;
+  danger?: boolean;
+}) {
+  return (
+    <button
+      type="button"
+      title={label}
+      aria-label={label}
+      disabled={disabled}
+      onClick={(e) => { e.stopPropagation(); onClick(); }}
+      style={{
+        display: "inline-flex", alignItems: "center", justifyContent: "center",
+        width: "26px", height: "26px", borderRadius: "6px",
+        border: "none", background: "transparent",
+        cursor: disabled ? "default" : "pointer", fontFamily: "inherit",
+        color: danger ? C.dangerRed : C.textMuted, opacity: disabled ? 0.4 : 1,
+      }}
+      onMouseEnter={(e) => { if (!disabled) e.currentTarget.style.background = C.surface; }}
+      onMouseLeave={(e) => { e.currentTarget.style.background = "transparent"; }}
+    >
+      {children}
+    </button>
+  );
+}
 
 function WelcomeHome({ summary, onPick, disabled }: { summary: InventorySummary; onPick: (text: string) => void; disabled: boolean }) {
   return (
