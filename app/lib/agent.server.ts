@@ -19,9 +19,14 @@ interface AdminClient {
 }
 
 export interface AgentResponse {
+  /** The model's short reasoning shown in the collapsible "Thinking…" chip. */
+  reasoning: string;
+  /** The final answer body shown below the chip. Clean prose — no emojis, no action summaries glued in. */
   response: string;
   actions: ToolResult[];
   provider: "nvidia" | "demo";
+  /** Wall-clock ms the agent took (LLM call + tool execution). Shown in the chip. */
+  elapsedMs: number;
 }
 
 export async function runAgent(params: {
@@ -31,6 +36,7 @@ export async function runAgent(params: {
 }): Promise<AgentResponse> {
   const { admin, shop, message } = params;
   const ctx: ToolCtx = { admin, shop };
+  const startedAt = Date.now();
 
   // 1. Load recent history (last 10 turns) for context.
   const recent = await prisma.chatMessage.findMany({
@@ -73,8 +79,11 @@ export async function runAgent(params: {
     }
   }
 
-  // 4. Compose the reply.
+  // 4. Compose the reply. Body = clean prose (no emoji, no action lines —
+  //    the client renders action cards separately below the body).
+  const elapsedMs = Date.now() - startedAt;
   const response = composeReply(plan.reasoning, actions, plan.provider);
+  const reasoning = plan.reasoning.trim();
 
   // 5. Persist + audit.
   await prisma.chatMessage.create({ data: { shop, role: "user", content: message } });
@@ -83,6 +92,8 @@ export async function runAgent(params: {
       shop,
       role: "assistant",
       content: response,
+      reasoning: reasoning || null,
+      elapsedMs,
       actionsJson: JSON.stringify(actions),
     },
   });
@@ -94,16 +105,38 @@ export async function runAgent(params: {
     message: `Reeve replied: ${response.slice(0, 140)}${response.length > 140 ? "…" : ""}`,
   });
 
-  return { response, actions, provider: plan.provider };
+  return { reasoning, response, actions, provider: plan.provider, elapsedMs };
 }
 
+/**
+ * Compose the body shown to the merchant. Clean prose only — action summaries
+ * render as separate cards on the client, so we don't glue ✅/⚠️ lines in here.
+ * We DO include a small closing note when actions failed (so the merchant has
+ * some context inline even if action cards were the only signal), but no emoji.
+ */
 function composeReply(reasoning: string, actions: ToolResult[], provider: string): string {
   const parts: string[] = [];
-  if (reasoning?.trim()) parts.push(reasoning.trim());
+  // The model's reasoning stays in the chip, NOT the body — but if the model
+  // produced no reasoning at all (e.g. failed JSON parse → demo fallback), fall
+  // back to using reasoning-style text as the body so the merchant sees something.
+  const body = reasoning.trim();
+
   const succeeded = actions.filter((a) => a.ok);
   const failed = actions.filter((a) => !a.ok);
-  if (succeeded.length) parts.push("✅ " + succeeded.map((a) => a.summary).join("  •  "));
-  if (failed.length) parts.push("⚠️ " + failed.map((a) => `${a.summary} (${a.error})`).join("  •  "));
-  const tag = provider === "nvidia" ? "" : " _(demo mode — set NVIDIA_API_KEY for live AI)_";
-  return (parts.join("\n\n") || "Done.") + tag;
+
+  if (body) {
+    parts.push(body);
+    if (failed.length) {
+      parts.push(`Note: ${failed.length} action(s) failed — see the action cards below for details.`);
+    }
+  } else if (succeeded.length || failed.length) {
+    // No reasoning at all — synthesize a minimal body from the action summaries.
+    if (succeeded.length) parts.push(`Done — ${succeeded.map((a) => a.summary).join("; ")}.`);
+    if (failed.length) parts.push(`${failed.length} action(s) failed: ${failed.map((a) => a.summary).join("; ")}.`);
+  } else {
+    parts.push("Done.");
+  }
+
+  const tag = provider === "nvidia" ? "" : " (demo mode — set NVIDIA_API_KEY for live AI)";
+  return parts.join("\n\n") + tag;
 }

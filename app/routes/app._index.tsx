@@ -36,8 +36,18 @@ const CONTENT_MAX = 720; // px — Gemini's content width feel
 
 interface InventorySummary { total: number; inStock: number; lowStock: number; outOfStock: number; topLow: { id: string; title: string; inventory: number }[] }
 interface ChatAction { name: string; summary: string; ok: boolean; error?: string }
-interface Message { id: string; role: string; content: string; actions: ChatAction[] | null }
+interface Message {
+  id: string;
+  role: string;
+  content: string;
+  actions: ChatAction[] | null;
+  reasoning?: string | null; // assistant only; null for user + legacy rows
+  elapsedMs?: number | null; // assistant only; null for user + legacy rows
+}
 interface LoaderData { summary: InventorySummary; messages: Message[]; provider: "nvidia" | "demo" }
+
+/** Shape returned by POST /app/chat — used by the optimistic assistant-reply effect. */
+interface ChatResult { response?: string; reasoning?: string | null; actions?: ChatAction[]; elapsedMs?: number | null; error?: string }
 
 export const loader = async ({ request }: LoaderFunctionArgs): Promise<LoaderData> => {
   const { admin, session } = await authenticate.admin(request);
@@ -72,6 +82,8 @@ export const loader = async ({ request }: LoaderFunctionArgs): Promise<LoaderDat
     summary: { total, inStock, lowStock, outOfStock, topLow: lowList.slice(0, 5) },
     messages: dbMessages.reverse().map((m) => ({
       id: m.id, role: m.role, content: m.content,
+      reasoning: m.reasoning ?? null,
+      elapsedMs: m.elapsedMs ?? null,
       actions: m.actionsJson ? (JSON.parse(m.actionsJson) as ChatAction[]) : null,
     })),
     provider: process.env.NVIDIA_API_KEY ? "nvidia" : "demo",
@@ -83,7 +95,7 @@ export const loader = async ({ request }: LoaderFunctionArgs): Promise<LoaderDat
 export default function ReeveChat() {
   const { summary, messages: initialMessages, provider } = useLoaderData<typeof loader>();
   const fetcher = useFetcher<typeof loader>();
-  const chatFetcher = useFetcher<{ response?: string; actions?: ChatAction[]; error?: string }>();
+  const chatFetcher = useFetcher<ChatResult>();
   const shopify = useAppBridge();
 
   const [messages, setMessages] = useState<Message[]>(initialMessages);
@@ -117,7 +129,10 @@ export default function ReeveChat() {
         lastReplyRef.current = sig;
         setMessages((m) => [...m, {
           id: `a-${Date.now()}`, role: "assistant",
-          content: chatFetcher.data.response!, actions: chatFetcher.data.actions ?? null,
+          content: chatFetcher.data.response!,
+          reasoning: chatFetcher.data.reasoning ?? null,
+          elapsedMs: chatFetcher.data.elapsedMs ?? null,
+          actions: chatFetcher.data.actions ?? null,
         }]);
         shopify.toast.show("Reeve replied");
         fetcher.load("/app");
@@ -156,7 +171,8 @@ export default function ReeveChat() {
           <>
             {messages.map((m) => <MessageRow key={m.id} msg={m} />)}
             {isThinking && (
-              <div style={{ display: "inline-flex", gap: "5px", alignItems: "center", padding: "10px 0", marginLeft: "2px" }}>
+              <div style={{ display: "flex", gap: "8px", alignItems: "center", padding: "10px 0", marginLeft: "2px" }}>
+                <span style={{ fontSize: "13px", color: C.textMuted }}>Thinking</span>
                 <span style={thinkingDot(0)} />
                 <span style={thinkingDot(1)} />
                 <span style={thinkingDot(2)} />
@@ -283,12 +299,46 @@ function MessageRow({ msg }: { msg: Message }) {
   }
   return (
     <div style={{ marginBottom: "22px" }}>
+      {msg.reasoning && msg.reasoning.trim() && <ReasoningChip reasoning={msg.reasoning} elapsedMs={msg.elapsedMs} />}
       <div style={{ fontSize: "14px", lineHeight: 1.7, color: C.textPrimary, whiteSpace: "pre-wrap", wordBreak: "break-word" }}>
         {msg.content}
       </div>
       {msg.actions && msg.actions.length > 0 && (
         <div style={{ marginTop: "10px", display: "flex", flexDirection: "column", gap: "6px" }}>
           {msg.actions.map((a, i) => <ActionCard key={i} action={a} />)}
+        </div>
+      )}
+    </div>
+  );
+}
+
+/** Collapsible "Thought for Ns" chip — ChatGPT/Claude pattern. */
+function ReasoningChip({ reasoning, elapsedMs }: { reasoning: string; elapsedMs?: number | null }) {
+  const [open, setOpen] = useState(false);
+  const seconds = elapsedMs != null ? Math.max(1, Math.round(elapsedMs / 1000)) : null;
+  const label = seconds != null ? `Thought for ${seconds}s` : "Reasoning";
+  return (
+    <div style={{ marginBottom: "10px" }}>
+      <button
+        onClick={() => setOpen((o) => !o)}
+        style={{
+          display: "inline-flex", alignItems: "center", gap: "6px",
+          border: "none", background: "transparent", cursor: "pointer",
+          fontFamily: "inherit", fontSize: "12px", color: C.textMuted,
+          padding: "2px 0",
+        }}
+      >
+        <span style={{ fontSize: "12px", lineHeight: 1, transform: open ? "rotate(90deg)" : "none", transition: "transform 0.15s ease", display: "inline-block" }}>{">"}</span>
+        <span>{label}</span>
+      </button>
+      {open && (
+        <div style={{
+          marginTop: "6px", padding: "10px 12px",
+          background: C.surface2, border: `1px solid ${C.border}`, borderRadius: "8px",
+          fontSize: "12px", lineHeight: 1.6, color: C.textMuted,
+          whiteSpace: "pre-wrap", wordBreak: "break-word",
+        }}>
+          {reasoning}
         </div>
       )}
     </div>

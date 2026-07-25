@@ -41,7 +41,12 @@ model ChatMessage {
   shop         String
   role         String // user | assistant
   content      String
-  /// JSON: [{name, args, result, summary}] — the agent's tool calls, for action cards.
+  /// The model's short reasoning shown in the collapsible "Thinking…" chip.
+  /// Null for legacy rows (rendered without the chip) and for user messages.
+  reasoning    String?
+  /// Wall-clock ms the agent took (planning + tools). Null for legacy rows.
+  elapsedMs    Int?
+  /// JSON: [{name, args, result, summary, ok}] — the agent's tool calls, rendered as action cards.
   actionsJson  String?
   createdAt    DateTime @default(now())
 
