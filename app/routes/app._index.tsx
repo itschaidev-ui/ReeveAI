@@ -171,8 +171,9 @@ export default function ReeveChat() {
           <>
             {messages.map((m) => <MessageRow key={m.id} msg={m} />)}
             {isThinking && (
-              <div style={{ display: "flex", gap: "8px", alignItems: "center", padding: "10px 0", marginLeft: "2px" }}>
-                <span style={{ fontSize: "13px", color: C.textMuted }}>Thinking</span>
+              <div style={{ display: "flex", gap: "10px", alignItems: "center", padding: "10px 0 12px" }}>
+                <ReeveThinkingIcon />
+                <span style={{ fontSize: "13px", color: C.textMuted, fontWeight: 500 }}>Thinking</span>
                 <span style={thinkingDot(0)} />
                 <span style={thinkingDot(1)} />
                 <span style={thinkingDot(2)} />
@@ -299,12 +300,19 @@ function MessageRow({ msg }: { msg: Message }) {
   }
   return (
     <div style={{ marginBottom: "22px" }}>
-      {msg.reasoning && msg.reasoning.trim() && <ReasoningChip reasoning={msg.reasoning} elapsedMs={msg.elapsedMs} />}
-      <div style={{ fontSize: "14px", lineHeight: 1.7, color: C.textPrimary, whiteSpace: "pre-wrap", wordBreak: "break-word" }}>
-        {msg.content}
+      <div style={{ display: "flex", gap: "10px", alignItems: "flex-start" }}>
+        <div style={{ flexShrink: 0, paddingTop: "2px" }}>
+          <ReeveIcon cardColor={C.textPrimary} size={18} />
+        </div>
+        <div style={{ flex: 1, minWidth: 0 }}>
+          {msg.reasoning && msg.reasoning.trim() && <ReasoningChip reasoning={msg.reasoning} elapsedMs={msg.elapsedMs} />}
+          <div style={{ fontSize: "14px", lineHeight: 1.7, color: C.textPrimary, whiteSpace: "pre-wrap", wordBreak: "break-word" }}>
+            {msg.content}
+          </div>
+        </div>
       </div>
       {msg.actions && msg.actions.length > 0 && (
-        <div style={{ marginTop: "10px", display: "flex", flexDirection: "column", gap: "6px" }}>
+        <div style={{ marginTop: "10px", marginLeft: "28px", display: "flex", flexDirection: "column", gap: "6px" }}>
           {msg.actions.map((a, i) => <ActionCard key={i} action={a} />)}
         </div>
       )}
@@ -324,8 +332,8 @@ function ReasoningChip({ reasoning, elapsedMs }: { reasoning: string; elapsedMs?
         style={{
           display: "inline-flex", alignItems: "center", gap: "6px",
           border: "none", background: "transparent", cursor: "pointer",
-          fontFamily: "inherit", fontSize: "12px", color: C.textMuted,
-          padding: "2px 0",
+          fontFamily: "inherit", fontSize: "12px", fontWeight: 500, color: C.textMuted,
+          padding: "4px 0", userSelect: "none",
         }}
       >
         <span style={{ fontSize: "12px", lineHeight: 1, transform: open ? "rotate(90deg)" : "none", transition: "transform 0.15s ease", display: "inline-block" }}>{">"}</span>
@@ -333,10 +341,11 @@ function ReasoningChip({ reasoning, elapsedMs }: { reasoning: string; elapsedMs?
       </button>
       {open && (
         <div style={{
-          marginTop: "6px", padding: "10px 12px",
-          background: C.surface2, border: `1px solid ${C.border}`, borderRadius: "8px",
-          fontSize: "12px", lineHeight: 1.6, color: C.textMuted,
+          marginTop: "8px", padding: "12px 14px",
+          background: C.surface2, border: `1px solid ${C.border}`, borderRadius: "10px",
+          fontSize: "13px", lineHeight: 1.65, color: C.textMuted, fontStyle: "italic",
           whiteSpace: "pre-wrap", wordBreak: "break-word",
+          boxShadow: "inset 0 0 0 0 transparent",
         }}>
           {reasoning}
         </div>
@@ -392,13 +401,54 @@ function thinkingDot(delay: number): React.CSSProperties {
   };
 }
 
+// ─── Reeve brand icon (rounded-square card + inverted R silhouette) ─────────
+// Card color follows `cardColor`; the R silhouette stays white. Pass muted grey
+// while the agent is generating, full black once the reply has landed.
+function ReeveIcon({ cardColor = "#1F1F1F", size = 18 }: { cardColor?: string; size?: number }) {
+  const h = Math.round((size * 1038) / 1156);
+  return (
+    <svg viewBox="0 0 1156 1038" width={size} height={h} aria-hidden style={{ display: "block" }}>
+      <path
+        d="M0.25 0.25C385.42 0.25 770.58 0.25 1155.75 0.25C1155.75 346.08 1155.75 691.92 1155.75 1037.75C770.58 1037.75 385.42 1037.75 0.25 1037.75C0.25 691.92 0.25 346.08 0.25 0.25ZM708.61 598.5C718.13 593.37 728.35 589.78 737.75 584.27C760.12 571.17 780.63 551.88 794.34 529.82C809.78 504.97 815.62 475.44 815.98 446.5C816.31 420.25 813.36 394.4 803.57 369.89C790.18 336.36 761.57 309.52 729.59 293.87C677.14 268.21 616.27 272.36 559.5 272.38C508.83 272.39 458.16 272.39 407.5 272.86C389.83 273.03 372.16 273.06 354.5 273.33C347.21 273.43 339.76 273.08 332.5 273.65C332.33 283.24 335.79 293.31 337.64 302.73C340.54 317.44 343.78 332.08 346.58 346.8C354.48 388.46 363.94 429.84 372.26 471.42C374.87 484.41 378.02 497.31 380.31 510.37C381.17 515.25 382.87 520.05 383.5 524.93C377.66 526.89 368.67 523.98 362.46 523.33C349.13 521.95 335.84 520.17 322.5 518.82C316.35 518.2 309.25 516.6 303.21 517.5C308.62 526.69 311.98 537.46 316.35 547.2C326.66 570.22 336.85 593.29 347.17 616.34C379.76 689.18 411.88 762.25 444.4 835.12C455.61 860.25 466.76 885.44 477.87 910.62C480.56 916.7 483.07 922.82 485.5 929C486.79 932.26 487.23 934.77 490.5 935.52C478.17 830.72 465.83 725.93 453.5 621.13C478.45 621.92 503.4 622.71 528.35 623.5C513.55 540.5 498.76 457.5 483.96 374.5C490.75 373.09 498.51 373.94 505.5 373.93C518.83 373.9 532.17 373.88 545.5 373.87C555.5 373.86 565.5 373.86 575.5 373.86C616.85 373.85 672.43 367.84 695.71 410.76C698.85 416.56 700.5 423.22 701.71 429.66C703.59 439.63 703.84 450.5 702.06 460.5C700.81 467.49 698.74 474.61 695.44 480.92C676.72 516.65 640.09 518.35 604.5 518.46C591.17 518.49 577.83 518.67 564.5 518.76C557.84 518.81 551.16 518.92 544.5 518.86C540.85 518.83 537.01 518.05 533.5 518.84C535.57 525.12 541.13 531.12 544.74 536.75C553.98 551.14 563.41 565.4 572.76 579.74C601.69 624.11 630.66 668.48 659.83 712.69C670.31 728.57 680.53 744.62 691.02 760.51C693.81 764.73 696.56 768.97 699.28 773.25C700.3 774.85 701.2 777.58 702.98 778.51C705.76 779.96 710.43 779.07 713.5 779.05C721.17 779.01 728.83 779.06 736.5 779.05C757.5 779.04 778.5 779.05 799.5 779.08C808.93 779.1 821.99 780.73 830.89 778.5C790.13 718.5 749.37 658.5 708.61 598.5Z"
+        fill={cardColor}
+        fillRule="evenodd"
+      />
+      <path
+        d="M708.61 598.5C749.37 658.5 790.13 718.5 830.89 778.5C821.99 780.73 808.93 779.1 799.5 779.08C778.5 779.05 757.5 779.04 736.5 779.05C728.83 779.06 721.17 779.01 713.5 779.05C710.43 779.07 705.76 779.96 702.98 778.51C701.2 777.58 700.3 774.85 699.28 773.25C696.56 768.97 693.81 764.73 691.02 760.51C680.53 744.62 670.31 728.57 659.83 712.69C630.66 668.48 601.69 624.11 572.76 579.74C563.41 565.4 553.98 551.14 544.74 536.75C541.13 531.12 535.57 525.12 533.5 518.84C537.01 518.05 540.85 518.83 544.5 518.86C551.16 518.92 557.84 518.81 564.5 518.76C577.83 518.67 591.17 518.49 604.5 518.46C640.09 518.35 676.72 516.65 695.44 480.92C698.74 474.61 700.81 467.49 702.06 460.5C703.84 450.5 703.59 439.63 701.71 429.66C700.5 423.22 698.85 416.56 695.71 410.76C672.43 367.84 616.85 373.85 575.5 373.86C565.5 373.86 555.5 373.86 545.5 373.87C532.17 373.88 518.83 373.9 505.5 373.93C498.51 373.94 490.75 373.09 483.96 374.5C498.76 457.5 513.55 540.5 528.35 623.5C503.4 622.71 478.45 621.92 453.5 621.13C465.83 725.93 478.17 830.72 490.5 935.52C487.23 934.77 486.79 932.26 485.5 929C483.07 922.82 480.56 916.7 477.87 910.62C466.76 885.44 455.61 860.25 444.4 835.12C411.88 762.25 379.76 689.18 347.17 616.34C336.85 593.29 326.66 570.22 316.35 547.2C311.98 537.46 308.62 526.69 303.21 517.5C309.25 516.6 316.35 518.2 322.5 518.82C335.84 520.17 349.13 521.95 362.46 523.33C368.67 523.98 377.66 526.89 383.5 524.93C382.87 520.05 381.17 515.25 380.31 510.37C378.02 497.31 374.87 484.41 372.26 471.42C363.94 429.84 354.48 388.46 346.58 346.8C343.78 332.08 340.54 317.44 337.64 302.73C335.79 293.31 332.33 283.24 332.5 273.65C339.76 273.08 347.21 273.43 354.5 273.33C372.16 273.06 389.83 273.03 407.5 272.86C458.16 272.39 508.83 272.39 559.5 272.38C616.27 272.36 677.14 268.21 729.59 293.87C761.57 309.52 790.18 336.36 803.57 369.89C813.36 394.4 816.31 420.25 815.98 446.5C815.62 475.44 809.78 504.97 794.34 529.82C780.63 551.88 760.12 571.17 737.75 584.27C728.35 589.78 718.13 593.37 708.61 598.5Z"
+        fill="#ffffff"
+        fillRule="evenodd"
+      />
+    </svg>
+  );
+}
+
+/** Thinking-row icon: muted grey card + white R, plus a horizontal light sweep
+ *  that plays only while the agent is generating. The sweep is a thin
+ *  translucent white bar that travels left-to-right across the icon. */
+function ReeveThinkingIcon({ size = 18 }: { size?: number }) {
+  return (
+    <div style={{ position: "relative", width: `${size}px`, height: `${Math.round((size * 1038) / 1156)}px`, overflow: "hidden", borderRadius: "3px", flexShrink: 0 }}>
+      <ReeveIcon cardColor={C.textMuted} size={size} />
+      <div
+        style={{
+          position: "absolute", top: 0, left: 0, height: "100%", width: "40%",
+          background: "linear-gradient(90deg, rgba(255,255,255,0) 0%, rgba(255,255,255,0.55) 50%, rgba(255,255,255,0) 100%)",
+          animation: "reeveSweep 1.6s ease-in-out infinite",
+          pointerEvents: "none",
+        }}
+      />
+    </div>
+  );
+}
+
 // ─── Per-route CSS (keyframes only) + headers ────────────────────────────
 
 export const links = () => [
   {
     rel: "stylesheet",
     href: "data:text/css," + encodeURIComponent(
-      "@keyframes reevePulse{0%,100%{opacity:0.25;transform:scale(0.85)}50%{opacity:0.9;transform:scale(1)}}",
+      "@keyframes reevePulse{0%,100%{opacity:0.25;transform:scale(0.85)}50%{opacity:0.9;transform:scale(1)}}" +
+      "@keyframes reeveSweep{0%{transform:translateX(-120%)}100%{transform:translateX(280%)}}",
     ),
   },
 ];
