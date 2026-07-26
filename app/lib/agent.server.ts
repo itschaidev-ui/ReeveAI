@@ -153,16 +153,29 @@ export async function runAgent(params: {
             : describeWriteCall(call.name, ex.args),
         });
       }
-      // Edge case: model proposed a write with no read to fill from and no id
-      // of its own. Surface a single placeholder so the Approve flow still
-      // renders (and the answer LLM can explain it needs a product).
+      // Edge case: model proposed a write but we couldn't resolve a target id
+      // (no read ran, the read returned 0 rows, or the read failed). DO NOT
+      // surface a broken Approve card — a write with no target id can never be
+      // approved and just confuses the merchant. Instead, push a synthetic
+      // action card that explains the gap, so the answer LLM + UI can phrase it
+      // honestly ("I searched but found no products matching that").
       if (expanded.length === 0) {
-        pendingWrites.push({
-          nonce: `pw-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
-          tool: call.name,
-          args: call.args,
-          summary: describeWriteCall(call.name, call.args),
+        const readRan = actions.some((a) => !isWriteTool(a.name));
+        const anyEmptyRead = actions.some((a) => !isWriteTool(a.name) && a.ok && Array.isArray(a.result) && (a.result as unknown[]).length === 0);
+        const readFailed = actions.some((a) => !isWriteTool(a.name) && !a.ok);
+        const reason = anyEmptyRead
+          ? "Search returned no matching products — nothing to update."
+          : readFailed
+            ? "Search failed, so I couldn't determine which product to update."
+            : readRan
+              ? "Search returned results but I couldn't resolve a target product id."
+              : "No search ran before this write, so I have no product to target.";
+        actions.push({
+          name: call.name, args: call.args, result: null,
+          summary: `Proposed write skipped — ${reason}`,
+          ok: false, error: reason,
         });
+        // Do NOT push to pendingWrites. No broken Approve card.
       }
       continue;
     }
@@ -197,7 +210,20 @@ export async function runAgent(params: {
   const writeGateSummary = pendingWrites.length
     ? `\n\n[WRITE GATE STATUS — READ CAREFULLY]: ${pendingWrites.length} write(s) PROPOSED but NONE EXECUTED. The merchant has NOT approved them yet. They will run on the NEXT turn only if the merchant says yes or clicks Approve. Do NOT describe any write as completed/done/applied/successful this turn — use "I have proposed X, awaiting your approval".`
     : (actions.some((a) => isWriteTool(a.name))
-      ? `\n\n[WRITE GATE STATUS]: No writes were proposed or executed this turn.`
+      // Distinguish WHY no writes were proposed. The most common cause is the
+      // search returned no matches (the set the merchant described is empty).
+      // In that case the model should say "found none" — NOT "name a product".
+      ? (() => {
+          const anyEmptyRead = actions.some((a) => !isWriteTool(a.name) && a.ok && Array.isArray(a.result) && (a.result as unknown[]).length === 0);
+          const readFailed = actions.some((a) => !isWriteTool(a.name) && !a.ok);
+          if (anyEmptyRead) {
+            return `\n\n[WRITE GATE STATUS]: No writes were proposed because the search returned NO matching products. Tell the merchant you found none matching their criteria. Do NOT ask them to name a product — the search already ran and the set is empty. If they expected matches, suggest they check the status filter or try a different condition.`;
+          }
+          if (readFailed) {
+            return `\n\n[WRITE GATE STATUS]: No writes were proposed because a search FAILED. Tell the merchant the search hit an error and suggest retrying.`;
+          }
+          return `\n\n[WRITE GATE STATUS]: No writes were proposed or executed this turn. If you have product results but couldn't resolve a target, ask the merchant to name a specific product. If you didn't search, search now is not possible (this turn is over) — tell the merchant what you need them to specify.`;
+        })()
       : "");
   const answerResult = await askLlmAnswer(
     [...history, { role: "user", content: message }],
