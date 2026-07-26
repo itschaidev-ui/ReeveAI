@@ -17,6 +17,13 @@ import { authenticate } from "../shopify.server";
 import { boundary } from "@shopify/shopify-app-react-router/server";
 import prisma from "../db.server";
 import type { ReasoningEffort } from "../lib/llm.server";
+import {
+  ResponsiveContainer,
+  LineChart, Line, AreaChart, Area,
+  BarChart, Bar, Cell,
+  PieChart, Pie,
+  XAxis, YAxis, CartesianGrid, Tooltip, LabelList,
+} from "recharts";
 
 // ─── Color tokens (single source of truth) ─────────────────────────────────
 const C = {
@@ -1040,6 +1047,10 @@ function ActionCard({ action: a }: { action: ChatAction }) {
   if (a.name === "get_low_stock_products" && Array.isArray(a.result) && a.result.length > 0) {
     return <InventoryAlertCard action={a} rows={a.result as AlertRow[]} />;
   }
+  // The chart_* tools return a Recharts-ready shape; render that as a chart card.
+  if (a.name.startsWith("chart_") && a.ok) {
+    return <ChartCard action={a} />;
+  }
   return <CompactActionCard action={a} />;
 }
 
@@ -1058,6 +1069,161 @@ function CompactActionCard({ action: a }: { action: ChatAction }) {
       {a.error && <div style={{ color: C.dangerRed, marginTop: "3px", fontSize: "11px" }}>{a.error}</div>}
     </div>
   );
+}
+
+function ChartCard({ action: a }: { action: ChatAction }) {
+  // Recharts renders inside this card. Each chart_* tool returns a specific
+  // result shape we read here — see agent-tools.server.ts dispatch cases.
+  // On any unparseable shape, fall back to CompactActionCard so the surface
+  // degrades to a quiet text row rather than a blank div.
+  const result = a.result as
+    | { points?: { date: string; count?: number; net?: number; gross?: number; refunds?: number }[] }
+    | { bars?: { name: string; qty?: number; usage?: number; sales?: number; status?: string }[] }
+    | { slices?: { label: string; value: number }[]; dimension?: string }
+    | undefined;
+
+  if (!result || typeof result !== "object") return <CompactActionCard action={a} />;
+
+  // Shared surface matching the Gemini-style cards used elsewhere in the app.
+  const cardStyle: React.CSSProperties = {
+    border: `1px solid ${C.border}`, borderRadius: "10px", background: C.bg,
+    boxShadow: "0 1px 3px rgba(60,64,67,0.06)", overflow: "hidden",
+  };
+  const headerStyle: React.CSSProperties = {
+    padding: "10px 14px", borderBottom: `1px solid ${C.border}`, fontSize: "12px",
+    color: C.textPrimary, fontWeight: 500, display: "flex", alignItems: "center", gap: "8px",
+  };
+  const bodyStyle: React.CSSProperties = { padding: "12px 10px 6px", height: 220 };
+  const axisTick: React.CSSProperties = { fontSize: 10, fill: C.textMuted };
+
+  // Rotating palette so the donut still reads when explicit per-slice colors are absent.
+  const sliceColors = [C.accentBlue, C.okGreen, "#5F6368", "#F9AB00", "#A142F4", C.dangerRed, "#1E8E3E"];
+
+  const tooltipStyle: React.CSSProperties = {
+    background: "#FFFFFF", border: `1px solid ${C.border}`, borderRadius: "6px",
+    fontSize: 11, color: C.textPrimary, boxShadow: "0 2px 6px rgba(60,64,67,0.08)",
+  };
+  const moneyFmt = (v: number) => v.toLocaleString("en-US", { style: "currency", currency: "USD", maximumFractionDigits: 0 });
+
+  // ── line / area charts (sales_over_time, new_customers_over_time)
+  if ("points" in result && Array.isArray(result.points) && result.points.length > 0) {
+    const isSales = a.name === "chart_sales_over_time";
+    const data = result.points.map((p) => ({
+      date: p.date,
+      count: p.count ?? 0,
+      net: p.net ?? 0,
+      gross: p.gross ?? 0,
+      refunds: p.refunds ?? 0,
+    }));
+    const glyph = isSales ? "₵" : "↗";
+    return (
+      <div style={cardStyle}>
+        <div style={headerStyle}>
+          <span style={{ color: isSales ? C.okGreen : C.accentBlue }}>{glyph}</span>
+          <span style={{ flex: 1 }}>{a.summary}</span>
+        </div>
+        <div style={bodyStyle}>
+          <ResponsiveContainer width="100%" height="100%">
+            {isSales ? (
+              <AreaChart data={data} margin={{ top: 6, right: 14, left: 4, bottom: 0 }}>
+                <defs>
+                  <linearGradient id="reeve-sales-grad" x1="0" y1="0" x2="0" y2="1">
+                    <stop offset="0%" stopColor={C.okGreen} stopOpacity={0.25} />
+                    <stop offset="100%" stopColor={C.okGreen} stopOpacity={0.04} />
+                  </linearGradient>
+                </defs>
+                <CartesianGrid stroke={C.border} strokeDasharray="3 3" vertical={false} />
+                <XAxis dataKey="date" tick={axisTick} tickLine={false} axisLine={{ stroke: C.border }} minTickGap={20} />
+                <YAxis tick={axisTick} tickLine={false} axisLine={false} width={48} tickFormatter={moneyFmt} />
+                <Tooltip contentStyle={tooltipStyle} formatter={(v: number) => moneyFmt(v)} labelStyle={{ color: C.textMuted }} />
+                <Area type="monotone" dataKey="net" stroke={C.okGreen} strokeWidth={2} fill="url(#reeve-sales-grad)" name="Net" />
+              </AreaChart>
+            ) : (
+              <LineChart data={data} margin={{ top: 6, right: 14, left: 4, bottom: 0 }}>
+                <CartesianGrid stroke={C.border} strokeDasharray="3 3" vertical={false} />
+                <XAxis dataKey="date" tick={axisTick} tickLine={false} axisLine={{ stroke: C.border }} minTickGap={20} />
+                <YAxis tick={axisTick} tickLine={false} axisLine={false} width={32} allowDecimals={false} />
+                <Tooltip contentStyle={tooltipStyle} labelStyle={{ color: C.textMuted }} />
+                <Line type="monotone" dataKey="count" stroke={C.accentBlue} strokeWidth={2} dot={false} name="New customers" />
+              </LineChart>
+            )}
+          </ResponsiveContainer>
+        </div>
+      </div>
+    );
+  }
+
+  // ── horizontal bar charts (top_products_by_units, top_discounts_by_usage)
+  if ("bars" in result && Array.isArray(result.bars) && result.bars.length > 0) {
+    const isDiscounts = a.name === "chart_top_discounts_by_usage";
+    const data = result.bars.map((b) => ({
+      name: b.name,
+      qty: b.qty ?? 0,
+      usage: b.usage ?? 0,
+      sales: b.sales ?? 0,
+    }));
+    return (
+      <div style={cardStyle}>
+        <div style={headerStyle}>
+          <span style={{ color: C.accentBlue }}>#</span>
+          <span style={{ flex: 1 }}>{a.summary}</span>
+        </div>
+        <div style={bodyStyle}>
+          <ResponsiveContainer width="100%" height="100%">
+            <BarChart data={data} layout="vertical" margin={{ top: 2, right: 28, left: 8, bottom: 2 }}>
+              <CartesianGrid stroke={C.border} strokeDasharray="3 3" horizontal={false} />
+              <XAxis type="number" tick={axisTick} tickLine={false} axisLine={{ stroke: C.border }} allowDecimals={false} />
+              <YAxis type="category" dataKey="name" tick={axisTick} tickLine={false} axisLine={false} width={120} />
+              <Tooltip contentStyle={tooltipStyle} labelStyle={{ color: C.textMuted }} cursor={{ fill: C.surface }} />
+              <Bar dataKey={isDiscounts ? "usage" : "qty"} fill={isDiscounts ? "#A142F4" : C.accentBlue} radius={[3, 3, 3, 3]} maxBarSize={26}>
+                <LabelList dataKey={isDiscounts ? "usage" : "qty"} position="right" style={{ fontSize: 10, fill: C.textMuted }} />
+              </Bar>
+            </BarChart>
+          </ResponsiveContainer>
+        </div>
+      </div>
+    );
+  }
+
+  // ── pie / donut for revenue_by_dimension and inventory_distribution
+  if ("slices" in result && Array.isArray(result.slices) && result.slices.length > 0) {
+    const data = result.slices.map((s) => ({ name: s.label, value: s.value }));
+    const isMoney = a.name === "chart_revenue_by_dimension"; // inventory uses counts, not money
+    return (
+      <div style={cardStyle}>
+        <div style={headerStyle}>
+          <span style={{ color: C.accentBlue }}>●</span>
+          <span style={{ flex: 1 }}>{a.summary}</span>
+        </div>
+        <div style={bodyStyle}>
+          <ResponsiveContainer width="100%" height="100%">
+            <PieChart>
+              <Pie data={data} dataKey="value" nameKey="name" innerRadius={48} outerRadius={78} paddingAngle={2}>
+                {data.map((_, i) => <Cell key={i} fill={sliceColors[i % sliceColors.length]} stroke={C.bg} strokeWidth={1.5} />)}
+              </Pie>
+              <Tooltip
+                contentStyle={tooltipStyle}
+                labelStyle={{ color: C.textMuted }}
+                formatter={(v: number, n: string) => [`${isMoney ? moneyFmt(v) : v.toLocaleString()} — ${n}`, isMoney ? "Revenue" : "Count"]}
+              />
+            </PieChart>
+          </ResponsiveContainer>
+        </div>
+        {/* inline legend so merchants read slice labels without hovering */}
+        <div style={{ padding: "6px 14px 10px", display: "flex", flexWrap: "wrap", gap: "6px 14px", fontSize: 11, color: C.textMuted }}>
+          {data.slice(0, 7).map((s, i) => (
+            <span key={s.name} style={{ display: "inline-flex", alignItems: "center", gap: 5 }}>
+              <span style={{ width: 9, height: 9, borderRadius: 2, background: sliceColors[i % sliceColors.length], display: "inline-block" }} />
+              <span>{s.name} · {isMoney ? moneyFmt(s.value) : s.value.toLocaleString()}</span>
+            </span>
+          ))}
+        </div>
+      </div>
+    );
+  }
+
+  // No recognizable chart shape — back to compact text row.
+  return <CompactActionCard action={a} />;
 }
 
 function InventoryAlertCard({ action: a, rows }: { action: ChatAction; rows: AlertRow[] }) {

@@ -70,6 +70,44 @@ export const toolCatalog = [
     description: "Return a synthesized health summary: total products, low-stock count, out-of-stock count. READ-only.",
     args: {},
   },
+  // ─── Chart tools (read-only aggregations that return a Recharts-ready shape) ───
+  // These produce a chart card in the chat thread. Pick by MERCHANT INTENT:
+  //   "show sales/revenue over time"          → chart_sales_over_time(days=30)
+  //   "top products / best sellers / units"   → chart_top_products_by_units(days=30, limit=10)
+  //   "revenue/units by type/vendor"          → chart_revenue_by_dimension(dimension="product_type", days=30)
+  //   "inventory health / catalog breakdown"  → chart_inventory_distribution(dimension="status"|"product_type"|"vendor"|"stock_health")
+  //   "new customers over time"               → chart_new_customers_over_time(days=90)
+  //   "top/most-used discounts/codes"         → chart_top_discounts_by_usage(limit=8)
+  {
+    name: "chart_sales_over_time",
+    description: "Return a daily/weekly line chart of NET sales over the last N days (default 30, max 365). Net = gross order total minus refunds, in shop currency. Use when the merchant asks for a sales trend, revenue over time, or 'how are sales going'. READ-only — runs immediately and renders as a line chart card. Note: capped at the most recent ~1000 orders in the window; for shops with very high order volume it shows a 'last 1000 orders' caveat.",
+    args: { days: "number?" },
+  },
+  {
+    name: "chart_top_products_by_units",
+    description: "Return a horizontal bar chart ranking the top products by UNITS SOLD over the last N days (default 30). Use when the merchant asks 'what are my best sellers', 'top products', 'most-sold items'. READ-only. Args: days (default 30, max 365), limit (default 10, max 25).",
+    args: { days: "number?", limit: "number?" },
+  },
+  {
+    name: "chart_revenue_by_dimension",
+    description: "Bucket order REVENUE (gross line-item totals) into a donut (≤7 slices) or bar chart by a categorical dimension over the last N days. Use for 'revenue by product_type', 'sales by vendor', 'orders by status'. READ-only. Args: dimension = 'product_type' | 'vendor' | 'status' | 'fulfillment_status' (required), days (default 30, max 365).",
+    args: { dimension: "string", days: "number?" },
+  },
+  {
+    name: "chart_inventory_distribution",
+    description: "Snapshot the CURRENT catalog as a donut (≤7 slices) by: 'status' (ACTIVE/DRAFT/ARCHIVED/UNLISTED), 'product_type', 'vendor', or 'stock_health' (in-stock ≤ threshold, low ≤5, out ≤0 — same threshold already used elsewhere). No date window — this is a live catalog count. READ-only. Args: dimension (required).",
+    args: { dimension: "string" },
+  },
+  {
+    name: "chart_new_customers_over_time",
+    description: "Line chart of new customers per day/week over the last N days (default 90). Use when the merchant asks 'how many new customers', 'customer growth', 'signups over time'. READ-only. Capped at the most recent ~1000 customers; over about 60 days it collapses to a weekly bucket for readability.",
+    args: { days: "number?" },
+  },
+  {
+    name: "chart_top_discounts_by_usage",
+    description: "Horizontal bar chart of the most-used discount codes (price rules) by USAGE count and total sales. Use when the merchant asks 'which discounts work best', 'most-used codes', 'coupon performance'. READ-only. Args: limit (default 8, max 25).",
+    args: { limit: "number?" },
+  },
 ];
 
 /** Tools that mutate Shopify state. These are gated behind an Approve card —
@@ -94,6 +132,17 @@ const schemas = {
   set_product_status: z.object({ productId: z.string(), status: z.enum(["ACTIVE", "DRAFT", "ARCHIVED", "UNLISTED"]) }),
   update_price: z.object({ variantId: z.string(), price: z.string() }),
   summarize_inventory: z.object({}).strict(),
+  chart_sales_over_time: z.object({ days: z.number().int().min(1).max(365).optional() }),
+  chart_top_products_by_units: z.object({ days: z.number().int().min(1).max(365).optional(), limit: z.number().int().min(1).max(25).optional() }),
+  chart_revenue_by_dimension: z.object({
+    dimension: z.enum(["product_type", "vendor", "status", "fulfillment_status"]),
+    days: z.number().int().min(1).max(365).optional(),
+  }),
+  chart_inventory_distribution: z.object({
+    dimension: z.enum(["status", "product_type", "vendor", "stock_health"]),
+  }),
+  chart_new_customers_over_time: z.object({ days: z.number().int().min(1).max(365).optional() }),
+  chart_top_discounts_by_usage: z.object({ limit: z.number().int().min(1).max(25).optional() }),
 } as const;
 
 export type ToolName = keyof typeof schemas;
@@ -105,6 +154,60 @@ async function gql<T>(admin: AdminClient, query: string, variables?: Record<stri
   const json = (await res.json()) as { data?: T; errors?: unknown };
   if (json.errors) throw new Error(`GraphQL errors: ${JSON.stringify(json.errors)}`);
   return json.data as T;
+}
+
+// ─── Pagination helpers (used by the chart_* / aggregate read tools) ─────────────
+// Shopify GraphQL connections are cursor-based (first/after, no offset) with a
+// hard cap of 250 rows per page and 1000 cost points per query. We cap at 4
+// pages (1000 rows) so aggregations stay well within the cost ceiling; the
+// chart caption surfaces a "showing last ~1000 rows" note when the cap kicks.
+
+const MAX_PAGES = 4;
+const PAGE_SIZE = 250;
+
+/** Detect access-denied / scope errors from GraphQL result text so we can return
+ *  a friendlier ToolResult.ok=false rather than a raw stack trace. The cli's
+ *  gql() helper throws on `json.errors`, so this trap lives in the dispatch
+ *  wrapper around the order/customer/discount queries specifically. */
+function scopeError(extra: string): string {
+  return `Scope error — Reeve needs ${extra}. Re-authorize the app (Shopify admin will prompt for the new scopes on next open).`;
+}
+
+/** Pull a human-readable "showing last N rows" caveat for a chart caption when
+ *  we hit our pagination cap. Returns the empty string when we have everything. */
+function caveatIfCapped(rowsFetched: number, hitCap: boolean, thing: string): string {
+  return hitCap ? ` (showing last ~${rowsFetched} ${thing} in window)` : "";
+}
+
+/** ISO date bucket key — daily for windows under ~60d, weekly otherwise so the
+ *  chart stays readable at scale. Returns "YYYY-MM-DD" (week starts Monday). */
+function bucketKey(iso: string, days: number): string {
+  const d = new Date(iso);
+  if (days <= 60) {
+    return d.toISOString().slice(0, 10); // YYYY-MM-DD
+  }
+  // weekly bucket — round date down to Monday
+  const day = d.getUTCDay(); // 0=Sun..6=Sat
+  const diff = (day + 6) % 7; // days since Monday
+  const monday = new Date(d);
+  monday.setUTCDate(d.getUTCDate() - diff);
+  return monday.toISOString().slice(0, 10);
+}
+
+/** Sum money-set fields safely (parsing strings, ignoring null/undefined). */
+function sumMoney(amounts: Array<string | number | null | undefined>): number {
+  let total = 0;
+  for (const a of amounts) {
+    if (a == null) continue;
+    total += typeof a === "number" ? a : parseFloat(a);
+    if (!isFinite(total)) { total = 0; break; }
+  }
+  return total;
+}
+
+/** Currency formatting for chart captions. "$1,234.50" style. */
+function money(n: number): string {
+  return n.toLocaleString("en-US", { style: "currency", currency: "USD", maximumFractionDigits: 2 });
 }
 
 // ─── Dispatch ────────────────────────────────────────────────────────────────
@@ -262,11 +365,259 @@ export async function dispatch(
         return ok(name, args, { total, low_stock: low, out_of_stock: out, in_stock: total - low - out }, `Summarized ${total} products (${low} low, ${out} out)`);
       }
 
+      // ── chart_sales_over_time ────────────────────────────────────────────────
+      case "chart_sales_over_time": {
+        const a = schemas.chart_sales_over_time.parse(args);
+        const days = a.days ?? 30;
+        const filter = `processed_at:>=-${days}d`;
+        interface OrderRow { processedAt: string; totalPriceSet: { shopMoney: { amount: string } }; totalRefundedSet: { shopMoney: { amount: string } } }
+        interface OrdersConn { orders: { edges: Array<{ node: OrderRow }>; pageInfo: { hasNextPage: boolean; endCursor: string | null } } }
+        const rows: OrderRow[] = [];
+        let cursor: string | null = null;
+        let page = 0;
+        let hitCap = false;
+        while (page < MAX_PAGES) {
+          const data = await gql<OrdersConn>(ctx.admin, `#graphql
+            query SalesPages($first: Int!, $query: String!, $after: String) {
+              orders(first: $first, query: $query, sortKey: PROCESSED_AT, after: $after) {
+                edges { node { processedAt totalPriceSet { shopMoney { amount } } totalRefundedSet { shopMoney { amount } } } }
+                pageInfo { hasNextPage endCursor }
+              }
+            }`, { first: PAGE_SIZE, query: filter, after: cursor });
+          for (const e of data.orders.edges) rows.push(e.node);
+          if (!data.orders.pageInfo.hasNextPage || !data.orders.pageInfo.endCursor) break;
+          cursor = data.orders.pageInfo.endCursor;
+          page++;
+          if (page >= MAX_PAGES) hitCap = true;
+        }
+        // Aggregate into day/week buckets.
+        const bucket = new Map<string, { net: number; gross: number; refunds: number }>();
+        for (const r of rows) {
+          const k = bucketKey(r.processedAt, days);
+          const gross = sumMoney([r.totalPriceSet?.shopMoney?.amount]);
+          const refunds = sumMoney([r.totalRefundedSet?.shopMoney?.amount]);
+          const cur = bucket.get(k) ?? { net: 0, gross: 0, refunds: 0 };
+          cur.gross += gross; cur.refunds += refunds; cur.net += gross - refunds;
+          bucket.set(k, cur);
+        }
+        const points = [...bucket.entries()]
+          .sort((x, y) => x[0].localeCompare(y[0]))
+          .map(([date, v]) => ({ date, net: Math.round(v.net * 100) / 100, gross: Math.round(v.gross * 100) / 100, refunds: Math.round(v.refunds * 100) / 100 }));
+        const totalNet = points.reduce((s, p) => s + p.net, 0);
+        const summary = `Daily net sales — last ${days} days · ${rows.length} orders · ${money(totalNet)}${caveatIfCapped(rows.length, hitCap, "orders")}`;
+        return ok(name, args, { points, ordersCount: rows.length, capped: hitCap }, summary);
+      }
+
+      // ── chart_top_products_by_units ───────────────────────────────────────────
+      case "chart_top_products_by_units": {
+        const a = schemas.chart_top_products_by_units.parse(args);
+        const days = a.days ?? 30;
+        const limit = a.limit ?? 10;
+        const filter = `processed_at:>=-${days}d`;
+        interface LineRow { quantity: number; product: { title: string } | null }
+        interface OrdersConn { orders: { edges: Array<{ node: { lineItems: { edges: Array<{ node: LineRow }> } } }>; pageInfo: { hasNextPage: boolean; endCursor: string | null } } }
+        const counts = new Map<string, number>();
+        let totalLines = 0, page = 0, hitCap = false;
+        let cursor: string | null = null;
+        while (page < MAX_PAGES) {
+          const data = await gql<OrdersConn>(ctx.admin, `#graphql
+            query TopProductsPages($first: Int!, $query: String!, $after: String) {
+              orders(first: $first, query: $query, sortKey: PROCESSED_AT, after: $after) {
+                edges { node { lineItems(first: 100) { edges { node { quantity product { title } } } } } }
+                pageInfo { hasNextPage endCursor }
+              }
+            }`, { first: PAGE_SIZE, query: filter, after: cursor });
+          for (const o of data.orders.edges) {
+            for (const li of o.node.lineItems.edges) {
+              const title = li.node.product?.title ?? "Unknown product";
+              counts.set(title, (counts.get(title) ?? 0) + (li.node.quantity ?? 0));
+              totalLines++;
+            }
+          }
+          if (!data.orders.pageInfo.hasNextPage || !data.orders.pageInfo.endCursor) break;
+          cursor = data.orders.pageInfo.endCursor;
+          page++;
+          if (page >= MAX_PAGES) hitCap = true;
+        }
+        const bars = [...counts.entries()]
+          .map(([name, qty]) => ({ name, qty }))
+          .sort((x, y) => y.qty - x.qty)
+          .slice(0, limit);
+        const top = bars[0];
+        const summary = `Top ${bars.length} products by units sold — last ${days} days · ${totalLines} line items${caveatIfCapped(totalLines, hitCap, "orders")}${top ? ` · #1 ${top.name} (${top.qty})` : ""}`;
+        return ok(name, args, { bars, totalLines, capped: hitCap }, summary);
+      }
+
+      // ── chart_revenue_by_dimension ────────────────────────────────────────────
+      case "chart_revenue_by_dimension": {
+        const a = schemas.chart_revenue_by_dimension.parse(args);
+        const days = a.days ?? 30;
+        const filter = `processed_at:>=-${days}d`;
+        interface LineRow { quantity: number; originalUnitPriceSet: { shopMoney: { amount: string } } | null; product: { productType: string; vendor: string; status: string } | null }
+        interface OrdersConn { orders: { edges: Array<{ node: { displayFulfillmentStatus: string; lineItems: { edges: Array<{ node: LineRow }> } } }>; pageInfo: { hasNextPage: boolean; endCursor: string | null } } }
+        const buckets = new Map<string, number>();
+        let linesN = 0, page = 0, hitCap = false, cursor: string | null = null;
+        while (page < MAX_PAGES) {
+          const data = await gql<OrdersConn>(ctx.admin, `#graphql
+            query RevByDim($first: Int!, $query: String!, $after: String) {
+              orders(first: $first, query: $query, sortKey: PROCESSED_AT, after: $after) {
+                edges { node { displayFulfillmentStatus lineItems(first: 100) { edges { node { quantity originalUnitPriceSet { shopMoney { amount } } product { productType vendor status } } } } } }
+                pageInfo { hasNextPage endCursor }
+              }
+            }`, { first: PAGE_SIZE, query: filter, after: cursor });
+          for (const o of data.orders.edges) {
+            for (const li of o.node.lineItems.edges) {
+              const price = sumMoney([li.node.originalUnitPriceSet?.shopMoney?.amount]);
+              const revenue = price * (li.node.quantity ?? 0);
+              let label = "Unknown";
+              const p = li.node.product;
+              switch (a.dimension) {
+                case "product_type": label = p?.productType || "Other"; break;
+                case "vendor": label = p?.vendor || "Other"; break;
+                case "status": label = p?.status || "UNKNOWN"; break;
+                case "fulfillment_status": label = o.node.displayFulfillmentStatus || "UNKNOWN"; break;
+              }
+              buckets.set(label, (buckets.get(label) ?? 0) + revenue);
+              linesN++;
+            }
+          }
+          if (!data.orders.pageInfo.hasNextPage || !data.orders.pageInfo.endCursor) break;
+          cursor = data.orders.pageInfo.endCursor;
+          page++;
+          if (page >= MAX_PAGES) hitCap = true;
+        }
+        const slices = [...buckets.entries()]
+          .map(([label, value]) => ({ label, value: Math.round(value * 100) / 100 }))
+          .sort((x, y) => y.value - x.value);
+        const total = slices.reduce((s, x) => s + x.value, 0);
+        const top = slices[0];
+        const summary = `Revenue by ${a.dimension} — last ${days} days · ${slices.length} ${a.dimension}s${caveatIfCapped(linesN, hitCap, "orders")} · ${money(total)} total${top ? ` · #1 ${top.label}` : ""}`;
+        return ok(name, args, { slices, dimension: a.dimension, total, capped: hitCap }, summary);
+      }
+
+      // ── chart_inventory_distribution ───────────────────────────────────────────
+      case "chart_inventory_distribution": {
+        const a = schemas.chart_inventory_distribution.parse(args);
+        interface ProdRow { id: string; status: string; productType: string; vendor: string; totalInventory: number }
+        interface ProductsConn { products: { edges: Array<{ node: ProdRow }>; pageInfo: { hasNextPage: boolean; endCursor: string | null } } }
+        const buckets = new Map<string, number>();
+        let total = 0, page = 0, hitCap = false, cursor: string | null = null;
+        while (page < MAX_PAGES) {
+          const data = await gql<ProductsConn>(ctx.admin, `#graphql
+            query InvDist($first: Int!, $after: String) {
+              products(first: $first, after: $after) {
+                edges { node { id status productType vendor totalInventory } }
+                pageInfo { hasNextPage endCursor }
+              }
+            }`, { first: PAGE_SIZE, after: cursor });
+          for (const e of data.products.edges) {
+            const n = e.node;
+            total++;
+            let label = "Other";
+            switch (a.dimension) {
+              case "status": label = n.status || "UNKNOWN"; break;
+              case "product_type": label = n.productType || "Other"; break;
+              case "vendor": label = n.vendor || "Other"; break;
+              case "stock_health":
+                label = n.totalInventory <= 0 ? "Out of stock"
+                  : n.totalInventory <= 5 ? "Low stock"
+                  : "In stock";
+                break;
+            }
+            buckets.set(label, (buckets.get(label) ?? 0) + 1);
+          }
+          if (!data.products.pageInfo.hasNextPage || !data.products.pageInfo.endCursor) break;
+          cursor = data.products.pageInfo.endCursor;
+          page++;
+          if (page >= MAX_PAGES) hitCap = true;
+        }
+        const slices = [...buckets.entries()]
+          .map(([label, value]) => ({ label, value }))
+          .sort((x, y) => y.value - x.value);
+        const summary = `Inventory by ${a.dimension} · ${total} products${caveatIfCapped(total, hitCap, "products")} · ${slices.length} ${a.dimension}s`;
+        return ok(name, args, { slices, dimension: a.dimension, total, capped: hitCap }, summary);
+      }
+
+      // ── chart_new_customers_over_time ──────────────────────────────────────────
+      case "chart_new_customers_over_time": {
+        const a = schemas.chart_new_customers_over_time.parse(args);
+        const days = a.days ?? 90;
+        const filter = `customer_date:>=-${days}d`;
+        interface CustRow { createdAt: string }
+        interface CustomersConn { customers: { edges: Array<{ node: CustRow }>; pageInfo: { hasNextPage: boolean; endCursor: string | null } } }
+        const counts = new Map<string, number>();
+        let total = 0, page = 0, hitCap = false, cursor: string | null = null;
+        while (page < MAX_PAGES) {
+          const data = await gql<CustomersConn>(ctx.admin, `#graphql
+            query NewCustomersPages($first: Int!, $query: String!, $after: String) {
+              customers(first: $first, query: $query, sortKey: CREATED_AT, after: $after) {
+                edges { node { createdAt } }
+                pageInfo { hasNextPage endCursor }
+              }
+            }`, { first: PAGE_SIZE, query: filter, after: cursor });
+          for (const e of data.customers.edges) {
+            const k = bucketKey(e.node.createdAt, days);
+            counts.set(k, (counts.get(k) ?? 0) + 1);
+            total++;
+          }
+          if (!data.customers.pageInfo.hasNextPage || !data.customers.pageInfo.endCursor) break;
+          cursor = data.customers.pageInfo.endCursor;
+          page++;
+          if (page >= MAX_PAGES) hitCap = true;
+        }
+        const points = [...counts.entries()]
+          .sort((x, y) => x[0].localeCompare(y[0]))
+          .map(([date, count]) => ({ date, count }));
+        const summary = `New customers — last ${days} days · ${total} total${caveatIfCapped(total, hitCap, "customers")}`;
+        return ok(name, args, { points, total, capped: hitCap }, summary);
+      }
+
+      // ── chart_top_discounts_by_usage ───────────────────────────────────────────
+      case "chart_top_discounts_by_usage": {
+        const a = schemas.chart_top_discounts_by_usage.parse(args);
+        const limit = a.limit ?? 8;
+        interface PriceRuleRow { title: string; usageCount: number; totalSales: { amount: string } | null; status: string }
+        interface PriceRulesData { priceRules: { edges: Array<{ node: PriceRuleRow }>; pageInfo: { hasNextPage: boolean; endCursor: string | null } } }
+        const rows: PriceRuleRow[] = [];
+        let page = 0, cursor: string | null = null;
+        while (page < 2) { // discounts rarely exceed a few rows; cap at 2 pages
+          const data = await gql<PriceRulesData>(ctx.admin, `#graphql
+            query PriceRules($first: Int!, $after: String) {
+              priceRules(first: $first, after: $after) {
+                edges { node { title usageCount totalSales { amount } status } }
+                pageInfo { hasNextPage endCursor }
+              }
+            }`, { first: Math.min(100, PAGE_SIZE), after: cursor });
+          for (const e of data.priceRules.edges) rows.push(e.node);
+          if (!data.priceRules.pageInfo.hasNextPage || !data.priceRules.pageInfo.endCursor) break;
+          cursor = data.priceRules.pageInfo.endCursor;
+          page++;
+        }
+        const bars = rows
+          .map((r) => ({ name: r.title || "Untitled", usage: r.usageCount ?? 0, sales: sumMoney([r.totalSales?.amount]), status: r.status }))
+          .sort((x, y) => y.usage - x.usage)
+          .slice(0, limit);
+        const top = bars[0];
+        const summary = `Top ${bars.length} discounts by usage · ${rows.length} total rules${top ? ` · #1 ${top.name} (${top.usage} uses)` : ""}`;
+        return ok(name, args, { bars, totalRules: rows.length }, summary);
+      }
+
       default:
         return fail(name, args, `Unknown tool: ${name}`, `Unknown tool: ${name}`);
     }
   } catch (e) {
-    return fail(name, args, (e as Error).message, `Tool ${name} failed`);
+    const msg = (e as Error).message;
+    // Friendlier message for the most common chart failure: scope not granted.
+    if (/access denied|FORBIDDEN|Requires access scope|read_orders/i.test(msg)) {
+      return fail(name, args, scopeError("read_orders (or the relevant scope)"), `Chart unavailable — needs scope re-auth`);
+    }
+    if (/read_customers/i.test(msg)) {
+      return fail(name, args, scopeError("read_customers"), `Chart unavailable — needs scope re-auth`);
+    }
+    if (/read_discounts|read_price_rules|read_reports/i.test(msg)) {
+      return fail(name, args, scopeError("read_discounts / read_price_rules / read_reports"), `Chart unavailable — needs scope re-auth`);
+    }
+    return fail(name, args, msg, `Tool ${name} failed`);
   }
 }
 

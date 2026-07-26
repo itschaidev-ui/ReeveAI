@@ -110,6 +110,18 @@ export async function askLlm(
     "- After the read returns, propose the write (or one write per matched product via auto-expand) in the SAME turn. The merchant should never have to ask twice for something you could have done in turn one.",
     "- Round-trips are friction. One user message → one search → one set of proposals is the goal.",
     "",
+    "CHARTS / DATA VISUALIZATION — when the merchant asks to SEE data ('show me...', 'chart...', 'graph...', 'visualize...', 'breakdown of...', 'over time', 'how are sales going', 'what are my top...', 'who are my best customers', 'which discounts are used most', 'how many new customers'), pick a chart_* tool to render the data, NOT a get_* tool:",
+    "- 'show sales / revenue / orders over time' or 'how am I doing recently' → chart_sales_over_time(days=30). days optional, default 30.",
+    "- 'what are my best sellers / top products / most-sold items' → chart_top_products_by_units(days=30, limit=10).",
+    "- 'revenue by product_type / vendor' or 'sales by X' (categorical split) → chart_revenue_by_dimension(dimension='product_type', days=30). dimension required, one of: product_type, vendor, status, fulfillment_status.",
+    "- 'inventory health / catalog breakdown / how are products distributed / what is my catalog' → chart_inventory_distribution(dimension='status'). dimension required, one of: status, product_type, vendor, stock_health.",
+    "- 'new customers / customer growth / signups over time' → chart_new_customers_over_time(days=90).",
+    "- 'best discounts / most-used codes / coupon performance' → chart_top_discounts_by_usage(limit=8).",
+    "- When you call a chart_* tool, the chat UI renders a chart card below your answer. You DON'T need to draw the chart — the card does. Just summarize the key finding in your answer prose (e.g. 'Sales totaled $42K over the last 30 days, with a slow week around the 14th — see the chart below.').",
+    "- chart_* tools are READs: disposition='execute'. They run immediately. Never propose them.",
+    "- If the merchant asks for both a chart AND a fix ('show me low-stock products and restock them'), emit BOTH tools in the same toolCalls batch: the chart_ tool AND the read+write sequence. One turn.",
+    "- Don't call a chart_* tool when the merchant wants a specific lookup ('do we have the blue snowboard?', 'find product B'). Use get_products for those — they return a text list, which is what the merchant actually wants.",
+    "",
     "Respond with STRICT JSON only, of the shape:",
     '{"reasoning":"<numbered reasoning steps>","toolCalls":[{"name":"<tool>","args":{...},"disposition":"execute|propose"}]}',
     "",
@@ -267,6 +279,155 @@ function demoPlan(message: string): Omit<LlmResult, "provider"> {
         args: { productId: "gid://shopify/Product/DEMO-PLACEHOLDER", status: "DRAFT" },
         disposition: "propose",
       }],
+    };
+  }
+
+  // ── Chart / visualization routing (chart_* tools). Mirror the chart routing
+  //    block in the live planner prompt so demo mode renders charts too.
+  //    Ordering rules (so we disambiguate "revenue by product type" from
+  //    "inventory by product type" and don't trip on bare "status"):
+  //      1. Inventory/catalog/stock keyword + a "by <dim>" or "distributed"
+  //         signal, AND no revenue/sales/orders keyword → chart_inventory_distribution.
+  //      2. "revenue|sales|orders by <dim>" or "breakdown by <dim>" with a real
+  //         dimension word → chart_revenue_by_dimension (beats sales-over-time).
+  //      3. Sales keyword + a time/trend signal → chart_sales_over_time.
+  //      4. Top/best-products phrasing → chart_top_products_by_units.
+  //      5. New-customer phrasing → chart_new_customers_over_time.
+  //      6. Discount usage phrasing → chart_top_discounts_by_usage.
+  //      7. Fall-through default → chart_inventory_distribution (status).
+  const isChartAsk =
+    /\b(chart|graph|visualize|visualise|plot|breakdown|distribution|distributed|over time|trend|trending|recently|lately)\b/i.test(m)
+    || /\bshow(me)?\b/i.test(m)
+    || /\b(how (are|is) .+ (going|doing|trending))\b/i.test(m)
+    || /\b(top|best|most.?sold|popular|best.?seller|bestseller)\s/i.test(m)
+    || /\b(revenue|sales|orders?)\s+by\b/i.test(m)
+    || /\bby\s+(product.?type|vendor|fulfillment\s?status)\b/i.test(m)
+    || (/\bhow many\b/i.test(m) && /\b(customer|customers|signups?|sign.?ups?)\b/i.test(m))
+    || (/\b(best|top|most.?used|which)\b/i.test(m) && /\b(discount|coupon|code|promo)\b/i.test(m));
+  if (isChartAsk) {
+    const hasRevenueKw = /\b(revenue|sales|orders?|income|gross|net|gmv)\b/i.test(m);
+    // Inventory keyword — the BLUNT inventory words only (inventory/catalog/stock),
+    // NOT bare "product" so "revenue by product type" doesn't trap here.
+    const bluntInvKw = /\b(inventory|catalog(ue)?|stock)\b/i.test(m);
+    const invBySubj = /\b(how (is|are) .+ (inventory|catalog(ue)?|stock))\b/i.test(m);
+    if ((bluntInvKw || invBySubj) && !hasRevenueKw) {
+      const hasByDim = /\bby\s+(product.?type|vendor|stock.?health|status)\b/i.test(m) || /\b(distributed|distribution|breakdown|overview)\b/i.test(m);
+      if (hasByDim || invBySubj) {
+        let dim = "status";
+        if (/product.?type/i.test(m)) dim = "product_type";
+        else if (/\bvendor\b/i.test(m)) dim = "vendor";
+        else if (/health/i.test(m)) dim = "stock_health";
+        else if (/\bstatus\b/i.test(m)) dim = "status";
+        return {
+          reasoning: num([
+            `Analyze Input \u2014 the merchant wants a catalog/inventory breakdown by ${dim}.`,
+            `Identify Intent \u2014 chart_inventory_distribution (READ, donut by ${dim}).`,
+            `Determine Response \u2014 render the donut from the current catalog snapshot.`,
+            `Plan Tool Calls \u2014 chart_inventory_distribution(dimension="${dim}").`,
+          ]),
+          toolCalls: [{ name: "chart_inventory_distribution", args: { dimension: dim } }],
+        };
+      }
+    }
+    // REVENUE BY DIMENSION — beats sales-over-time when a "by <dim>" pattern is
+    // present (a dimension split is not a time series). Catches plain
+    // "revenue by product_type" with no time window too.
+    const byDimRevenue = /\b(revenue|sales|orders?)\s+by\b/i.test(m) || /\bbreakdown\s+by\b/i.test(m);
+    const dimWord = /\b(product.?type|vendor|fulfillment\s?status)\b/i.test(m) || /\bby\s+status\b/i.test(m);
+    if ((byDimRevenue && dimWord) || byDimRevenue) {
+      let dim = "product_type";
+      if (/product.?type/i.test(m)) dim = "product_type";
+      else if (/\bvendor\b/i.test(m)) dim = "vendor";
+      else if (/fulfillment/i.test(m)) dim = "fulfillment_status";
+      else if (/\bstatus\b/i.test(m)) dim = "status";
+      const days = m.match(/\b(?:last|past|over the)\s+(\d+)\s*(?:d|day|days)\b/i);
+      const dN = days ? Number(days[1]) : 30;
+      return {
+        reasoning: num([
+          `Analyze Input \u2014 the merchant wants revenue split by ${dim}.`,
+          `Identify Intent \u2014 chart_revenue_by_dimension (READ, donut by ${dim}).`,
+          `Determine Response \u2014 render the donut over the last ${dN} days.`,
+          `Plan Tool Calls \u2014 chart_revenue_by_dimension(dimension="${dim}", days=${dN}).`,
+        ]),
+        toolCalls: [{ name: "chart_revenue_by_dimension", args: { dimension: dim, days: dN } }],
+      };
+    }
+    // SALES OVER TIME
+    const salesKw = hasRevenueKw;
+    const tenseKw =
+      /\b(over time|trend|trending|recently|lately|how (am|is) (i|it|sales|revenue|it going))\b/i.test(m)
+      || /\b(?:over the |over |last |past )\s?\d+\s*(?:d|day|days|w|wk|week|weeks|m|mo|month|months)\b/i.test(m)
+      || /\bgoing\b/i.test(m);
+    if (salesKw && tenseKw) {
+      const days = m.match(/\b(?:last|past|over the)\s+(\d+)\s*(?:d|day|days)\b/i);
+      const dN = days ? Number(days[1]) : 30;
+      return {
+        reasoning: num([
+          "Analyze Input \u2014 the merchant wants a sales-over-time trend.",
+          "Identify Intent \u2014 chart_sales_over_time (READ, daily net sales: gross minus refunds).",
+          `Determine Response \u2014 render the area chart over the last ${dN} days.`,
+          `Plan Tool Calls \u2014 chart_sales_over_time(days=${dN}).`,
+        ]),
+        toolCalls: [{ name: "chart_sales_over_time", args: { days: dN } }],
+      };
+    }
+    // TOP PRODUCTS BY UNITS SOLD
+    if (/\b(best|top|most.?sold|best.?sell(ing|ers?)?|popular|popular items|best sellers?)\b/i.test(m)
+        && /\b(product|sellers?|items?|selling|sold)\b/i.test(m)) {
+      const days = m.match(/\b(?:last|past|over the|this)\s+(\d+)\s*(d|day|days|w|wk|week|weeks|m|mo|month|months)\b/i);
+      let dayN = 30;
+      if (days) {
+        const n = Number(days[1]);
+        if (/^(w|wk|week|weeks)$/.test(days[2])) dayN = n * 7;
+        else if (/^(m|mo|month|months)$/.test(days[2])) dayN = n * 30;
+        else dayN = n;
+      }
+      return {
+        reasoning: num([
+          "Analyze Input \u2014 the merchant wants a ranking of best-selling products.",
+          "Identify Intent \u2014 chart_top_products_by_units (READ, horizontal bar by units sold).",
+          `Determine Response \u2014 render the bar chart over the last ${dayN} days, top 10.`,
+          `Plan Tool Calls \u2014 chart_top_products_by_units(days=${dayN}).`,
+        ]),
+        toolCalls: [{ name: "chart_top_products_by_units", args: { days: dayN, limit: 10 } }],
+      };
+    }
+    // NEW CUSTOMERS OVER TIME
+    if (/\b(new customers?|customer (growth|signups?|sign.?ups?)|customers? over time)\b/i.test(m) || (/\bhow many\b/i.test(m) && /\b(customer|signups?)\b/i.test(m))) {
+      const days = m.match(/\b(?:last|past|over the)\s+(\d+)\s*(?:d|day|days)\b/i);
+      const dN = days ? Number(days[1]) : 90;
+      return {
+        reasoning: num([
+          "Analyze Input \u2014 the merchant wants new-customer growth over time.",
+          "Identify Intent \u2014 chart_new_customers_over_time (READ, line per day/week).",
+          `Determine Response \u2014 render the line chart over the last ${dN} days.`,
+          `Plan Tool Calls \u2014 chart_new_customers_over_time(days=${dN}).`,
+        ]),
+        toolCalls: [{ name: "chart_new_customers_over_time", args: { days: dN } }],
+      };
+    }
+    // TOP DISCOUNTS BY USAGE
+    if (/\b(discount|coupon|promo(s|otions?)?|code)\s+(performance|used|usage|work)|best (discounts?|coupons?)|most.used (discounts?|codes?|coupons?)|which (discounts?|codes?|coupons?)/i.test(m)) {
+      return {
+        reasoning: num([
+          "Analyze Input \u2014 the merchant wants to rank discounts by usage.",
+          "Identify Intent \u2014 chart_top_discounts_by_usage (READ, horizontal bar by usageCount).",
+          "Determine Response \u2014 render the bar chart of the top 8 price rules.",
+          "Plan Tool Calls \u2014 chart_top_discounts_by_usage(limit=8).",
+        ]),
+        toolCalls: [{ name: "chart_top_discounts_by_usage", args: { limit: 8 } }],
+      };
+    }
+    // Generic chart ask with no specific metric named \u2014 default to inventory
+    // by status, the visual analogue of the old summarize_inventory path.
+    return {
+      reasoning: num([
+        "Analyze Input \u2014 generic chart request with no specific metric named.",
+        "Identify Intent \u2014 chart_inventory_distribution by status (READ, donut).",
+        "Determine Response \u2014 render the donut as a default overview.",
+        'Plan Tool Calls \u2014 chart_inventory_distribution(dimension="status").',
+      ]),
+      toolCalls: [{ name: "chart_inventory_distribution", args: { dimension: "status" } }],
     };
   }
 
