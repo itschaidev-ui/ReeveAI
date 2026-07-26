@@ -135,20 +135,35 @@ export async function runAgent(params: {
     }
     const wantsPropose = call.disposition === "propose" || isWriteTool(call.name);
     if (wantsPropose) {
-      // Auto-resolve missing target ids from this turn's already-executed read
-      // results. Lets the model propose a write against "the first low-stock
-      // product" without needing a re-plan loop.
-      const resolved = resolveWriteArgs(call.name, call.args, actions);
-      pendingWrites.push({
-        nonce: `pw-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
-        tool: call.name,
-        args: resolved.args,
-        // If we filled missing ids, surface that in the summary so the merchant
-        // can see WHICH product the write targets (not a blank id-tail).
-        summary: resolved.filledFromRead
-          ? describeWriteCall(call.name, resolved.args) + ` (from "${resolved.filledFromRead}")`
-          : describeWriteCall(call.name, resolved.args),
-      });
+      // Resolve + EXPAND. If the write is missing its target id AND a prior
+      // read this turn returned multiple matching rows, expand the single
+      // proposed write into one pending write PER row. This is the fix for the
+      // "3-turn dance": instead of asking the merchant to re-name the product
+      // after we already found it, we propose N writes right here.
+      //
+      // Single-row case behaves exactly as before (one write, one Approve card).
+      const expanded = expandWriteCall(call.name, call.args, actions);
+      for (const ex of expanded) {
+        pendingWrites.push({
+          nonce: `pw-${Date.now()}-${Math.random().toString(36).slice(2, 8)}-${Math.random().toString(36).slice(2, 5)}`,
+          tool: call.name,
+          args: ex.args,
+          summary: ex.filledFromRead
+            ? describeWriteCall(call.name, ex.args) + ` (from "${ex.filledFromRead}")`
+            : describeWriteCall(call.name, ex.args),
+        });
+      }
+      // Edge case: model proposed a write with no read to fill from and no id
+      // of its own. Surface a single placeholder so the Approve flow still
+      // renders (and the answer LLM can explain it needs a product).
+      if (expanded.length === 0) {
+        pendingWrites.push({
+          nonce: `pw-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+          tool: call.name,
+          args: call.args,
+          summary: describeWriteCall(call.name, call.args),
+        });
+      }
       continue;
     }
 
@@ -202,10 +217,23 @@ export async function runAgent(params: {
   // body with a truthful correction. The model has been observed saying "I have
   // proposed setting all 18 products to ACTIVE" while emitting zero write tool
   // calls — this catches that lie deterministically.
+  //
+  // The correction message distinguishes the two common zero-write causes:
+  //   (a) a search ran but returned no matches (e.g. "no archived products")
+  //   (b) no search ran at all (the model never looked)
+  // so the merchant gets an actionable next step instead of a generic apology.
   const writeClaimRegex = /\b(i have|ive|i|we)\s+(proposed|set|marked|updated|changed|applied|restocked|made)\b/i;
   const noWritesThisTurn = pendingWrites.length === 0 && !actions.some((a) => isWriteTool(a.name));
   if (noWritesThisTurn && writeClaimRegex.test(response)) {
-    response = "I wasn\'t able to propose any writes this turn — I can show you the relevant products, but to actually change one I\'ll need you to ask about a specific product by name. Which product would you like me to update, and to what?";
+    const readsRan = actions.filter((a) => !isWriteTool(a.name));
+    const anyEmptyResult = readsRan.some((a) => Array.isArray(a.result) && a.result.length === 0);
+    if (readsRan.length > 0 && anyEmptyResult) {
+      response = "I searched but found no products matching that — so there's nothing to change. If you expect matches, try a different status filter or product name and I'll search again.";
+    } else if (readsRan.length > 0) {
+      response = "I found some products but couldn't resolve which one to write to. Tell me the specific product name (or status, like 'archived') and I'll search and propose the change in one go.";
+    } else {
+      response = "I wasn't able to propose any writes this turn. Tell me the product name (or a status like 'archived') and what you want changed, and I'll search and propose it in one turn.";
+    }
   }
 
   // 5. Persist + audit. Both messages carry the conversationId so the loader
@@ -239,44 +267,70 @@ export async function runAgent(params: {
 }
 
 /**
- * If a proposed write is missing its target id(s), try to fill them from this
- * turn's already-executed READ action results. Returns the (possibly modified)
- * args plus a hint about which read row we sourced them from, so the summary
- * card can show the merchant what was matched.
+ * Resolve + EXPAND a proposed write call against this turn's already-executed
+ * READ results. If the write is missing its target id AND a prior read returned
+ * a list of candidate products/variants, we materialize one resolved write per
+ * matched row — collapsing "search → ask user → ask user again → propose" into
+ * a single turn.
  *
- * This is the band-aid for the missing re-plan loop: without it, the model
- * cannot propose a write for "the first low-stock product" because at plan
- * time it has not seen the read result yet.
+ * Behavior:
+ *   - Write already has its id (model provided it from history): pass through
+ *     unchanged as a single-element array. No expansion.
+ *   - Write is missing id, read returned N>0 rows: return N resolved writes,
+ *     one per row. Each gets a `filledFromRead` hint (the product title) so the
+ *     Approve card shows WHICH product that write targets.
+ *   - Write is missing id, no read returned rows: return [] (caller surfaces a
+ *     single placeholder so the answer LLM can explain the gap).
+ *
+ * CAP: to avoid runaway batch writes (e.g. "mark all 250 products active"),
+ * expansion is capped at MAX_BATCH. Beyond that the model is expected to ask
+ * the merchant to scope the request; we surface the truncation in reasoning.
  */
-function resolveWriteArgs(
+const MAX_BATCH = 25;
+function expandWriteCall(
   toolName: string,
   args: Record<string, unknown>,
   actions: ToolResult[],
-): { args: Record<string, unknown>; filledFromRead?: string } {
+): Array<{ args: Record<string, unknown>; filledFromRead?: string }> {
   const out = { ...args };
-  let filledFromRead: string | undefined;
+
+  // If the model already supplied the target id, no expansion needed.
+  const hasId =
+    (toolName === "set_product_status" && typeof out.productId === "string" && out.productId) ||
+    ((toolName === "update_price" || toolName === "update_inventory") && typeof out.variantId === "string" && out.variantId);
+  if (hasId) return [{ args: out }];
 
   // Find the first read action that returned a non-empty product/variant list.
   const readWithRows = actions.find(
     (a) => a.ok && Array.isArray(a.result) && (a.result as unknown[]).length > 0,
   );
-  if (!readWithRows) return { args: out };
+  if (!readWithRows) return [];
 
-  const rows = readWithRows.result as Array<Record<string, unknown>>;
-  const firstRow = rows[0];
-  const firstTitle = typeof firstRow.title === "string" ? firstRow.title : readWithRows.name;
-  filledFromRead = firstTitle;
+  const rows = (readWithRows.result as Array<Record<string, unknown>>).slice(0, MAX_BATCH);
+  const expanded: Array<{ args: Record<string, unknown>; filledFromRead?: string }> = [];
 
-  if (toolName === "set_product_status" && !out.productId && typeof firstRow.id === "string") {
-    out.productId = firstRow.id;
+  for (const row of rows) {
+    const rowArgs = { ...out };
+    const title = typeof row.title === "string" ? row.title : undefined;
+
+    if (toolName === "set_product_status" && typeof row.id === "string") {
+      rowArgs.productId = row.id;
+      expanded.push({ args: rowArgs, filledFromRead: title });
+      continue;
+    }
+    if (toolName === "update_price" || toolName === "update_inventory") {
+      // Prefer a variant id on the row; fall back to the row's own id.
+      const variants = Array.isArray(row.variants) ? (row.variants as Array<Record<string, unknown>>) : [];
+      const firstVariant = variants[0];
+      const variantId = (firstVariant && typeof firstVariant.id === "string")
+        ? firstVariant.id
+        : (typeof row.id === "string" ? row.id : undefined);
+      if (variantId) {
+        rowArgs.variantId = variantId;
+        expanded.push({ args: rowArgs, filledFromRead: title });
+      }
+    }
   }
-  if ((toolName === "update_price" || toolName === "update_inventory") && !out.variantId) {
-    // Prefer a variant id on the first row; fall back to the row's own id.
-    const variants = Array.isArray(firstRow.variants) ? (firstRow.variants as Array<Record<string, unknown>>) : [];
-    const firstVariant = variants[0];
-    if (firstVariant && typeof firstVariant.id === "string") out.variantId = firstVariant.id;
-    else if (typeof firstRow.id === "string") out.variantId = firstRow.id;
-  }
 
-  return { args: out, filledFromRead };
+  return expanded;
 }

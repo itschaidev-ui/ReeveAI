@@ -34,7 +34,7 @@ export interface ToolCtx {
 export const toolCatalog = [
   {
     name: "get_products",
-    description: "List products in the store with their inventory counts, status, and variant ids. Optional filter by query text. READ-only — runs immediately.",
+    description: "List products in the store with their inventory counts, status, and variant ids. READ-only — runs immediately. The `query` arg supports Shopify's search syntax — use it to filter BEFORE acting instead of asking the merchant to name products. Examples: query:'status:archived' (all archived), query:'status:draft', query:'status:active', query:'snowboard' (title match). Always prefer a targeted query over a broad one.",
     args: { query: "string?", limit: "number?" },
   },
   {
@@ -133,7 +133,11 @@ export async function dispatch(
           id: e.node.id, title: e.node.title, status: e.node.status, vendor: e.node.vendor,
           variants: e.node.variants.edges.map((v) => ({ id: v.node.id, price: v.node.price, inventory: v.node.inventoryQuantity })),
         }));
-        return ok(name, args, products, `Found ${products.length} product(s)`);
+        // Richer summary: list the matched product names + their statuses so
+        // the merchant can sanity-check what the search actually returned,
+        // instead of an opaque "Found 18 product(s)".
+        const summary = summarizeProductList(products, a.query);
+        return ok(name, args, products, summary);
       }
 
       // ── get_low_stock_products ────────────────────────────────────────────────
@@ -156,7 +160,8 @@ export async function dispatch(
             variants: e.node.variants.edges.map((v) => ({ id: v.node.id, inventory: v.node.inventoryQuantity })),
           }))
           .filter((p) => p.minInventory <= threshold);
-        return ok(name, args, low, `Found ${low.length} product(s) at or below ${threshold} units`);
+        const summary = summarizeProductList(low, `low stock (≤${threshold})`);
+        return ok(name, args, low, summary);
       }
 
       // ── get_locations (read) ──────────────────────────────────────────────────
@@ -270,6 +275,41 @@ function ok(name: string, args: Record<string, unknown>, result: unknown, summar
 }
 function fail(name: string, args: Record<string, unknown>, error: string, summary: string): ToolResult {
   return { name, args, result: null, summary, ok: false, error };
+}
+
+/**
+ * Build a transparent, merchant-readable summary of a product list result.
+ * Shows the count AND up to the first few product names + their statuses, so
+ * the merchant can sanity-check what the search actually returned instead of
+ * staring at an opaque "Found 18 product(s)" with no insight into which 18.
+ *
+ * Examples:
+ *   []                                 → "No products matched."
+ *   [{title:'A',status:'ARCHIVED'}]    → "Found 1 product: A (ARCHIVED)."
+ *   [4 products]                       → "Found 4 products: A (ARCHIVED), B (ARCHIVED), C (ARCHIVED), +1 more."
+ */
+function summarizeProductList(
+  products: Array<{ title?: string; status?: string; minInventory?: number }>,
+  contextLabel?: string,
+): string {
+  const n = products.length;
+  if (n === 0) {
+    return contextLabel
+      ? `No products matched ${contextLabel}.`
+      : "No products matched.";
+  }
+  const SHOW = 3; // cap inline names to keep the chip readable
+  const head = products.slice(0, SHOW).map((p) => {
+    const title = p.title ?? "Untitled";
+    const meta = typeof p.minInventory === "number"
+      ? `${p.minInventory} units`                              // low-stock context
+      : (p.status ? p.status : "");                            // status context
+    return meta ? `${title} (${meta})` : title;
+  });
+  const more = n > SHOW ? `, +${n - SHOW} more` : "";
+  const plural = n === 1 ? "product" : "products";
+  const ctx = contextLabel ? ` matching ${contextLabel}` : "";
+  return `Found ${n} ${plural}${ctx}: ${head.join(", ")}${more}.`;
 }
 
 /**

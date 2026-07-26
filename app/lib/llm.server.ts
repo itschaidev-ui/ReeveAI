@@ -100,8 +100,14 @@ export async function askLlm(
     "",
     "Required ids:",
     "- Write tools need ids (productId, variantId, locationId) you learned from a prior READ tool call (in this turn or earlier in chat history).",
-    "- If the merchant asks for a write and you do NOT yet have the required ids, FIRST emit the matching read tool (disposition:execute) to fetch them. Then, in the SAME toolCalls batch, also emit the write tool (disposition:propose) using the ids you expect to find — the agent loop auto-fills single-row results into the next call's missing ids.",
+    "- If the merchant asks for a write and you do NOT yet have the required ids, FIRST emit the matching read tool (disposition:execute) to fetch them. Then, in the SAME toolCalls batch, also emit the write tool (disposition:propose) — the agent loop auto-fills the id from the read result, and if the read returns multiple rows it expands the single write into one Approve card PER matched product.",
     "- Only say 'I will need you to ask again' if you genuinely cannot get the ids from any available read tool.",
+    "",
+    "PROACTIVE SEARCH — mandatory behavior:",
+    "- When the merchant references a SET of products by status or condition ('mark archived items as draft', 'set out-of-stock to unavailable', 'fix the draft products'), do NOT ask them to name the products. Search for the set yourself in the same turn using get_products with a status: query.",
+    "- get_products' `query` arg supports Shopify search syntax: 'status:archived', 'status:draft', 'status:active', or a title like 'snowboard'. Use the most specific filter that matches what the merchant described.",
+    "- After the read returns, propose the write (or one write per matched product via auto-expand) in the SAME turn. The merchant should never have to ask twice for something you could have done in turn one.",
+    "- Round-trips are friction. One user message → one search → one set of proposals is the goal.",
     "",
     "Respond with STRICT JSON only, of the shape:",
     '{"reasoning":"<numbered reasoning steps>","toolCalls":[{"name":"<tool>","args":{...},"disposition":"execute|propose"}]}',
@@ -168,6 +174,7 @@ export async function askLlmAnswer(
     '- If the user asked for something outside your tool scope (e.g. physically shipping items, billing, marketing, refunds), say so honestly and guide them to the right place in Shopify admin (e.g. Settings > Billing, Orders > Refunds, etc). Never silently fail — escalate.',
     '- BUT: never claim you lack a capability that is in your tool catalog (set_product_status, update_price, update_inventory). When the merchant asks for a product status change, price change, or inventory restock, your answer should describe the proposed action or its result, not refuse. If no proposed-write card was generated this turn, tell the merchant to ask again with a specific product so you can propose the write.',
     "- PENDING WRITES DID NOT HAPPEN YET. If the input mentions '[PROPOSED WRITES — awaiting merchant approval]', those writes have NOT run. Phrase them in future tense or as proposals: 'I have proposed marking <product> as DRAFT — approve below to apply it.' Never say 'I marked', 'I updated', or 'I changed' for a pending write. Only use past tense for actions whose results are listed in the tool execution results section.",
+    "- BATCH PROPOSALS: if the PROPOSED WRITES list contains more than one entry for the same kind of action (e.g. 3 set_product_status calls for 3 archived products), say so explicitly and concisely: 'I found 3 archived products — I've proposed marking all 3 as DRAFT. Approve each below.' Do not list every product name in the prose if the action cards already show them.",
     "- ABSOLUTE RULE: if the input contains [WRITE GATE STATUS]: No writes were proposed or executed this turn, you MUST NOT use any phrase that claims a write happened. Do not say I have proposed, I set, I marked, I updated, I changed, I applied, or I restocked. Instead, tell the merchant you can show them the data but need them to name a specific product (and target value) before you can propose a write.",
     "",
     "Plan reasoning (your own thinking step):",
@@ -268,7 +275,7 @@ function demoPlan(message: string): Omit<LlmResult, "provider"> {
   //
   //    DRAFT (unavailable) intent: out of stock, unavailable, discontinue,
   //      archive, unpublish, hide, draft, inactive, make unavailable.
-  //    ACTIVE (available) intent: active, available, publish, list, reinstate,
+  //    ACTIVE (available) intent: active, available, publish, reinstate,
   //      restore, make available, bring back, relist.
   //
   //    Order matters: an explicit ACTIVE keyword wins even if "draft" appears
@@ -276,36 +283,53 @@ function demoPlan(message: string): Omit<LlmResult, "provider"> {
   const draftKws = /\b(out of stock|unavailable|discontinue|discontinued|archive|archived|unpublish|unpublished|hide|hidden|draft|inactive|deactivate)\b/;
   const activeKws = /\b(active|activate|available|publish|published|list|listed|reinstate|restore|bring back|relist|relaunch)\b/;
   const statusVerbKws = /\b(mark|set|make|put|switch|change|update|turn|go)\b/;
-  const statusTrigger = /\b(active|activate|available|draft|unavailable|out of stock|discontinue|archive|unpublish|hide|inactive|deactivate|publish|reinstate|restore|relist|relaunch)\b/;
+  const statusTrigger = /\b(active|activate|available|draft|unavailable|out of stock|discontinue|archive|archived|unpublish|hide|inactive|deactivate|publish|reinstate|restore|relist|relaunch)\b/;
   if (statusTrigger.test(m) && (activeKws.test(m) || draftKws.test(m))) {
-    // Resolve direction: explicit ACTIVE beats DRAFT unless the merchant named
-    // a draft-state product AND used a make-active verb ("make the draft
-    // snowboard active" → ACTIVE; "mark this out of stock" → DRAFT).
     const wantsActive = activeKws.test(m);
     const targetStatus = wantsActive ? "ACTIVE" : "DRAFT";
-    // If the merchant named a specific product, search for it so the agent
-    // loop can auto-fill the productId. Otherwise fall back to the low-stock
-    // read (broad "mark all out of stock" style) and let auto-fill target it.
-    const hasSpecific = /\b(snowboard|shirt|shirt|coffee|mug|t-shirt|tshirt|tee|hat|cap|beanie|jacket|bag|book|mug|bottle|sticker|poster|print)\b/.test(m) ||
-      /\b(product|item|variant)\b/.test(m);
+
+    // Pick the read query. The key fix for the round-trip problem: instead of
+    // asking the merchant to name a product, we search for it ourselves using
+    // Shopify's status: filter. Three cases:
+    //   (a) "mark ARCHIVED items as draft"  → query: "status:archived" (search
+    //       for products currently in the SOURCE state the merchant mentioned)
+    //   (b) merchant named a specific product → query: "<name>" (title search)
+    //   (c) broad ("mark out-of-stock unavailable") → low-stock fallback
+    // The agent loop's expandWriteCall then turns the single proposed write
+    // into one Approve card PER matched product, all in one turn.
+    const sourceStatusMatch = m.match(/\b(archived?|draft|active|unlisted)\b(?:\s+(?:items?|products?|listings?))?/);
+    const namedProduct = m.match(/\b(snowboard|shirt|coffee|mug|t-shirt|tshirt|tee|hat|cap|beanie|jacket|bag|book|bottle|sticker|poster|print|socks?|pants?|hoodie|sweater|skateboard|guitar|keyboard)\b/);
+    let query: { name: "get_products"; args: { query?: string } } | { name: "get_low_stock_products"; args: {} };
+    let searchDesc: string;
+    if (sourceStatusMatch && sourceStatusMatch[1]) {
+      // Map natural-language status to Shopify's status: filter value.
+      const st = sourceStatusMatch[1].toLowerCase();
+      const stVal = st.startsWith("archiv") ? "archived"
+        : st === "draft" ? "draft"
+        : st === "active" ? "active"
+        : st.startsWith("unlist") ? "unlisted" : "archived";
+      query = { name: "get_products", args: { query: `status:${stVal}` } };
+      searchDesc = `status:${stVal} (proactively search for the products the merchant is asking about, rather than asking the merchant to name them)`;
+    } else if (namedProduct) {
+      query = { name: "get_products", args: { query: namedProduct[1] } };
+      searchDesc = `title:'${namedProduct[1]}'`;
+    } else {
+      query = { name: "get_low_stock_products", args: {} };
+      searchDesc = "low-stock list (no specific product or status named)";
+    }
+
     const reasoningLines = [
       `Analyze Input - the merchant wants a product status change to ${targetStatus}.`,
-      `Identify Intent - set_product_status (a WRITE tool, disposition: propose). ${hasSpecific ? "A specific product was named, so search for it first." : "No specific product named, so pull the low-stock list as the target candidate."}`,
-      "Determine Response - fetch the target product(s) (read), then propose the status change. The agent loop auto-fills the productId from the read result.",
-      `Plan Tool Calls - get the product (execute) + set_product_status with status ${targetStatus} (propose).`,
+      `Identify Intent - set_product_status (WRITE, propose). The agent will expand one proposal into one Approve card per matched product.`,
+      `Determine Response - search for the target product(s) using ${searchDesc}, then propose the status change for each match in the same turn.`,
+      `Plan Tool Calls - ${query.name} (execute) + set_product_status ${targetStatus} (propose, no id — agent fills from read).`,
     ];
-    const toolCalls = hasSpecific
-      ? [
-          { name: "get_products", args: {} },
-          { name: "set_product_status", args: { status: targetStatus }, disposition: "propose" as const },
-        ]
-      : [
-          { name: "get_low_stock_products", args: {} },
-          { name: "set_product_status", args: { status: targetStatus }, disposition: "propose" as const },
-        ];
     return {
       reasoning: num(reasoningLines),
-      toolCalls,
+      toolCalls: [
+        query,
+        { name: "set_product_status", args: { status: targetStatus }, disposition: "propose" },
+      ],
     };
   }
   // Status-change intent that mentions the verb but our keyword set didn't
@@ -341,7 +365,7 @@ function demoPlan(message: string): Omit<LlmResult, "provider"> {
       ]),
       toolCalls: [
         { name: "get_products", args: {} },
-        // variantId is intentionally omitted — resolveWriteArgs fills it from
+        // variantId is intentionally omitted — expandWriteCall fills it from
         // the get_products result above. price must be a string per the schema.
         { name: "update_price", args: { price: priceStr }, disposition: "propose" },
       ],
