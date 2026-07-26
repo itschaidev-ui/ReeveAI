@@ -55,8 +55,8 @@ export const toolCatalog = [
   },
   {
     name: "set_product_status",
-    description: "Set a product's status to ACTIVE or DRAFT (DRAFT makes the product unavailable/unlisted). WRITE — Reeve will PROPOSE this; the merchant must approve before it runs. Needs a productId (from get_low_stock_products/get_products results).",
-    args: { productId: "string", status: "ACTIVE|DRAFT" },
+    description: "Set a product's status. WRITE — Reeve will PROPOSE this; the merchant must approve before it runs. Needs a productId (from get_low_stock_products/get_products results). Status values: ACTIVE (ready to sell, listed on channels), DRAFT (not ready, unavailable), ARCHIVED (no longer sold, hidden from channels), UNLISTED (active but only viewable via direct link).",
+    args: { productId: "string", status: "ACTIVE|DRAFT|ARCHIVED|UNLISTED" },
     disposition: "propose",
   },
   {
@@ -91,7 +91,7 @@ const schemas = {
   get_low_stock_products: z.object({ threshold: z.number().int().min(0).optional() }),
   get_locations: z.object({}).strict(),
   update_inventory: z.object({ variantId: z.string(), locationId: z.string(), available: z.number().int().min(0) }),
-  set_product_status: z.object({ productId: z.string(), status: z.enum(["ACTIVE", "DRAFT"]) }),
+  set_product_status: z.object({ productId: z.string(), status: z.enum(["ACTIVE", "DRAFT", "ARCHIVED", "UNLISTED"]) }),
   update_price: z.object({ variantId: z.string(), price: z.string() }),
   summarize_inventory: z.object({}).strict(),
 } as const;
@@ -322,8 +322,12 @@ export function describeWriteCall(name: string, args: Record<string, unknown>): 
   const tail = (gid: unknown) => (typeof gid === "string" ? gid.split("/").pop() ?? gid : gid);
   switch (name) {
     case "set_product_status": {
-      const status = String(a.status ?? "?");
-      const verb = status.toUpperCase() === "DRAFT" ? "unavailable (DRAFT)" : status;
+      const status = String(a.status ?? "?").toUpperCase();
+      // Friendlier verbs for the Approve card so the merchant reads intent, not enum.
+      const verb = status === "DRAFT" ? "DRAFT (unavailable)"
+        : status === "ARCHIVED" ? "ARCHIVED (no longer sold)"
+        : status === "UNLISTED" ? "UNLISTED (direct-link only)"
+        : status;
       return `Mark product ${tail(a.productId)} as ${verb}`;
     }
     case "update_price":

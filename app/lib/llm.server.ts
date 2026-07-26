@@ -269,47 +269,85 @@ function demoPlan(message: string): Omit<LlmResult, "provider"> {
     };
   }
 
-  // ── Product status change (the most-requested write). Matches a wide band
-  //    of natural phrasings so the Approve card is actually reachable from
-  //    demo mode. Direction is decided by which keywords the merchant used.
+  // ── Product status change (the most-requested write). Two distinct signals
+  //    to parse apart, which the old code conflated:
+  //      SOURCE status = which products to search for (status:archived filter)
+  //      TARGET status = what to change them TO (the write's status arg)
+  //    "mark draft products as archived" → source=DRAFT, target=ARCHIVED.
+  //    "make archived items active"       → source=ARCHIVED, target=ACTIVE.
   //
-  //    DRAFT (unavailable) intent: out of stock, unavailable, discontinue,
-  //      archive, unpublish, hide, draft, inactive, make unavailable.
-  //    ACTIVE (available) intent: active, available, publish, reinstate,
-  //      restore, make available, bring back, relist.
+  //    Phrasing patterns we recognize:
+  //      "<source> items as <target>"   → explicit both (best case)
+  //      "mark X as <target>"            → target explicit, source = X (title)
+  //      "archive X" / "activate X"      → verb-as-target, source = X (title)
+  //      "make out-of-stock unavailable" → target=DRAFT, source = low-stock
   //
-  //    Order matters: an explicit ACTIVE keyword wins even if "draft" appears
-  //    elsewhere in the sentence (e.g. "make the draft snowboard active").
-  const draftKws = /\b(out of stock|unavailable|discontinue|discontinued|archive|archived|unpublish|unpublished|hide|hidden|draft|inactive|deactivate)\b/;
-  const activeKws = /\b(active|activate|available|publish|published|list|listed|reinstate|restore|bring back|relist|relaunch)\b/;
-  const statusVerbKws = /\b(mark|set|make|put|switch|change|update|turn|go)\b/;
-  const statusTrigger = /\b(active|activate|available|draft|unavailable|out of stock|discontinue|archive|archived|unpublish|hide|inactive|deactivate|publish|reinstate|restore|relist|relaunch)\b/;
-  if (statusTrigger.test(m) && (activeKws.test(m) || draftKws.test(m))) {
-    const wantsActive = activeKws.test(m);
-    const targetStatus = wantsActive ? "ACTIVE" : "DRAFT";
+  //    The agent loop's expandWriteCall turns the single proposed write into
+  //    one Approve card PER matched product, all in one turn.
+  const STATUS_VALUES = ["ACTIVE", "DRAFT", "ARCHIVED", "UNLISTED"] as const;
+  // Map natural-language words to the 4 canonical status values.
+  const wordToStatus: Record<string, string> = {
+    active: "ACTIVE", activate: "ACTIVE", live: "ACTIVE", available: "ACTIVE", listed: "ACTIVE", published: "ACTIVE", publish: "ACTIVE", sale: "ACTIVE", selling: "ACTIVE",
+    draft: "DRAFT", unavailable: "DRAFT", "out of stock": "DRAFT", "out-of-stock": "DRAFT", discontinue: "DRAFT", discontinued: "DRAFT", hide: "DRAFT", hidden: "DRAFT", inactive: "DRAFT", deactivate: "DRAFT", unpublish: "DRAFT", unpublished: "DRAFT",
+    archive: "ARCHIVED", archived: "ARCHIVED",
+    unlist: "UNLISTED", unlisted: "UNLISTED",
+  };
+  const statusVerbKws = /\b(mark|set|make|put|switch|change|update|turn|go|archive|activate|deactivate|publish|unpublish|hide|unhide|discontinue|reinstate|restore|relist|relaunch|bring back)\b/i;
+  // Find an explicit "<X> as <Y>" / "<X> to <Y>" target pattern first — this is
+  // the unambiguous case. Y is the target status.
+  const asMatch = m.match(/\b(?:as|to)\s+(active|activate|live|available|draft|unavailable|archive|archived|unlist(?:ed)?|inactive|hidden|published?|listed)\b/i);
+  let targetStatus: string | null = null;
+  if (asMatch && asMatch[1]) {
+    const w = asMatch[1].toLowerCase();
+    targetStatus = wordToStatus[w] ?? null;
+  }
+  // No "as <status>" pattern → look for a target verb ("archive the snowboard",
+  // "activate draft products"). The verb itself implies the target.
+  if (!targetStatus) {
+    if (/\barchive[d]?\b/i.test(m)) targetStatus = "ARCHIVED";
+    else if (/\b(activate|make active|make live|go live|bring back|reinstate|restore|relist|relaunch|republish|publish)\b/i.test(m)) targetStatus = "ACTIVE";
+    else if (/\b(draft|unavailable|out.of.stock|discontinue|hide|unpublish|inactive|deactivate)\b/i.test(m)) targetStatus = "DRAFT";
+    else if (/\bunlist(ed)?\b/i.test(m)) targetStatus = "UNLISTED";
+  }
 
-    // Pick the read query. The key fix for the round-trip problem: instead of
-    // asking the merchant to name a product, we search for it ourselves using
-    // Shopify's status: filter. Three cases:
-    //   (a) "mark ARCHIVED items as draft"  → query: "status:archived" (search
-    //       for products currently in the SOURCE state the merchant mentioned)
-    //   (b) merchant named a specific product → query: "<name>" (title search)
-    //   (c) broad ("mark out-of-stock unavailable") → low-stock fallback
-    // The agent loop's expandWriteCall then turns the single proposed write
-    // into one Approve card PER matched product, all in one turn.
-    const sourceStatusMatch = m.match(/\b(archived?|draft|active|unlisted)\b(?:\s+(?:items?|products?|listings?))?/);
+  // Now decide the SOURCE — which products to search for.
+  // Look for a status word BEFORE the "as/to" target, or a status describing
+  // the noun ("archived items", "draft products"). This is the source filter.
+  let sourceStatus: string | null = null;
+  if (asMatch && asMatch.index !== undefined) {
+    // Scan the text before the "as/to" for a status word.
+    const before = m.slice(0, asMatch.index);
+    const srcW = before.match(/\b(active|archived?|draft|unlist(?:ed)?|unavailable|out.of.stock|inactive|hidden|discontinued?)\b/i);
+    if (srcW && srcW[1]) {
+      const w = srcW[1].toLowerCase();
+      sourceStatus = wordToStatus[w] ?? null;
+      // Don't let source == target (would mean "mark active as active").
+      if (sourceStatus === targetStatus) sourceStatus = null;
+    }
+  }
+  // Also catch "<status> items/products" phrasing anywhere (source by noun).
+  if (!sourceStatus) {
+    const nounSrc = m.match(/\b(active|archived?|draft|unlist(?:ed)?)\s+(?:items?|products?|listings?|ones?|those|these)\b/i);
+    if (nounSrc && nounSrc[1]) {
+      const w = nounSrc[1].toLowerCase();
+      const s = wordToStatus[w] ?? null;
+      if (s && s !== targetStatus) sourceStatus = s;
+    }
+  }
+
+  // Trigger the status-change branch if we found a target AND a status verb.
+  if (targetStatus && STATUS_VALUES.includes(targetStatus as typeof STATUS_VALUES[number]) && statusVerbKws.test(m)) {
+    // Pick the read query:
+    //   - sourceStatus set    → query: "status:<source>" (search the set)
+    //   - named product       → query: "<name>" (title search)
+    //   - neither             → low-stock fallback (broad "mark out-of-stock")
     const namedProduct = m.match(/\b(snowboard|shirt|coffee|mug|t-shirt|tshirt|tee|hat|cap|beanie|jacket|bag|book|bottle|sticker|poster|print|socks?|pants?|hoodie|sweater|skateboard|guitar|keyboard)\b/);
     let query: { name: "get_products"; args: { query?: string } } | { name: "get_low_stock_products"; args: {} };
     let searchDesc: string;
-    if (sourceStatusMatch && sourceStatusMatch[1]) {
-      // Map natural-language status to Shopify's status: filter value.
-      const st = sourceStatusMatch[1].toLowerCase();
-      const stVal = st.startsWith("archiv") ? "archived"
-        : st === "draft" ? "draft"
-        : st === "active" ? "active"
-        : st.startsWith("unlist") ? "unlisted" : "archived";
+    if (sourceStatus) {
+      const stVal = sourceStatus.toLowerCase();
       query = { name: "get_products", args: { query: `status:${stVal}` } };
-      searchDesc = `status:${stVal} (proactively search for the products the merchant is asking about, rather than asking the merchant to name them)`;
+      searchDesc = `status:${stVal} (search the set the merchant described, don't ask them to name products)`;
     } else if (namedProduct) {
       query = { name: "get_products", args: { query: namedProduct[1] } };
       searchDesc = `title:'${namedProduct[1]}'`;
@@ -319,7 +357,7 @@ function demoPlan(message: string): Omit<LlmResult, "provider"> {
     }
 
     const reasoningLines = [
-      `Analyze Input - the merchant wants a product status change to ${targetStatus}.`,
+      `Analyze Input - the merchant wants to change products${sourceStatus ? ` currently in ${sourceStatus}` : ""} to ${targetStatus}.`,
       `Identify Intent - set_product_status (WRITE, propose). The agent will expand one proposal into one Approve card per matched product.`,
       `Determine Response - search for the target product(s) using ${searchDesc}, then propose the status change for each match in the same turn.`,
       `Plan Tool Calls - ${query.name} (execute) + set_product_status ${targetStatus} (propose, no id — agent fills from read).`,
