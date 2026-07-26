@@ -152,7 +152,6 @@ export default function ReeveChat() {
   const { summary, messages: initialMessages, conversations: initialConversations, activeConversationId: initialActive, provider } = useLoaderData<typeof loader>();
   const fetcher = useFetcher<typeof loader>();
   const chatFetcher = useFetcher<ChatResult>();
-  const approveFetcher = useFetcher<{ action?: ChatAction; error?: string }>();
   const convFetcher = useFetcher<ConversationResult>();
   const shopify = useAppBridge();
 
@@ -264,24 +263,13 @@ export default function ReeveChat() {
     return () => window.removeEventListener("reeve:stub", handler as EventListener);
   }, [shopify]);
 
-  // Bridge from the PendingWriteCard's Approve click to approveFetcher.submit.
-  // We do it via window events so the card stays a self-contained component
-  // and doesn't need approveFetcher props plumbed through.
-  useEffect(() => {
-    const handler = (e: Event) => {
-      const d = (e as CustomEvent<{ messageId: string; nonce: string; tool: string; args: Record<string, unknown> }>).detail;
-      approveFetcherRef.current = { messageId: d.messageId, nonce: d.nonce };
-      approveFetcher.submit(
-        { tool: d.tool, args: d.args },
-        { method: "POST", action: "/app/chat/approve", encType: "application/json" },
-      );
-      // Let the card know its click has been accepted.
-      window.dispatchEvent(new CustomEvent("reeve:approve-resolved", { detail: { nonce: d.nonce } }));
-    };
-    window.addEventListener("reeve:approve", handler as EventListener);
-    return () => window.removeEventListener("reeve:approve", handler as EventListener);
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, []);
+  // NOTE: approve dispatch used to live here via a shared approveFetcher +
+  // window events. That design only supported one in-flight approve at a time,
+  // so approving card 2 while card 1 was pending aborted card 1's request and
+  // left it stuck on "Approving…" forever. Each PendingWriteCard now owns its
+  // OWN useFetcher, so batch approvals run concurrently. The parent's only job
+  // is resolveWrite (called by the card when its fetcher lands) to splice the
+  // result into the message list.
 
   useEffect(() => {
     scrollRef.current?.scrollTo({ top: scrollRef.current.scrollHeight, behavior: "smooth" });
@@ -290,8 +278,15 @@ export default function ReeveChat() {
   const isThinking = chatFetcher.state !== "idle";
 
   /** Resolve a pending write by either removing it (cancel) or replacing it
-   *  with the action returned by /app/chat/approve. Called by PendingWriteCard. */
-  const resolveWrite = (params: { messageId: string; nonce: string; action?: ChatAction }) => {
+   *  with the action returned by /app/chat/approve. Called by PendingWriteCard.
+   *  If `action` is absent and `error` is present, the approve endpoint rejected
+   *  the write (e.g. invalid id) — surface that as an error toast and KEEP the
+   *  card so the merchant can retry or cancel, rather than silently dropping it. */
+  const resolveWrite = (params: { messageId: string; nonce: string; action?: ChatAction; error?: string }) => {
+    if (params.error && !params.action) {
+      shopify.toast.show(params.error, { isError: true });
+      return; // leave the card in place so the merchant can retry
+    }
     setMessages((ms) =>
       ms.map((m) => {
         if (m.id !== params.messageId) return m;
@@ -304,22 +299,6 @@ export default function ReeveChat() {
       shopify.toast.show(params.action.ok ? "Approved — done" : "Write failed", { isError: !params.action.ok });
     }
   };
-
-  // Drain approve fetcher results back into the message list.
-  useEffect(() => {
-    if (approveFetcher.state === "idle" && approveFetcher.data) {
-      const meta = approveFetcherRef.current;
-      if (meta) {
-        resolveWrite({ messageId: meta.messageId, nonce: meta.nonce, action: approveFetcher.data.action });
-        if (approveFetcher.data.error) shopify.toast.show(approveFetcher.data.error, { isError: true });
-        approveFetcherRef.current = null;
-      }
-    }
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [approveFetcher.data, approveFetcher.state]);
-
-  // Track which pending write is in-flight so we know where to slot the result.
-  const approveFetcherRef = useRef<{ messageId: string; nonce: string } | null>(null);
 
   const send = (text: string) => {
     const trimmed = text.trim();
@@ -1171,30 +1150,58 @@ function CardButton({ label }: { label: string }) {
 function PendingWriteCard({ messageId, write, onResolved }: {
   messageId: string;
   write: PendingWrite;
-  onResolved: (params: { messageId: string; nonce: string; action?: ChatAction }) => void;
+  onResolved: (params: { messageId: string; nonce: string; action?: ChatAction; error?: string }) => void;
 }) {
-  const [submitting, setSubmitting] = useState(false);
+  // Each card owns its OWN fetcher. The previous design shared one fetcher across
+  // all cards via window events, which meant approving card 2 while card 1 was
+  // still pending ABORTED card 1's request (useFetcher.submit on a busy fetcher
+  // cancels the in-flight call) — leaving card 1 stuck on "Approving…" forever.
+  // Per-card fetchers let batch approvals run truly concurrently.
+  const fetcher = useFetcher<{ action?: ChatAction; error?: string }>();
+  const submitting = fetcher.state !== "idle";
+
+  // Drain the fetcher result into the parent's message list. Runs whenever the
+  // fetcher transitions back to idle with data. If the endpoint returned an
+  // error with no action, pass it through so resolveWrite can surface it and
+  // KEEP the card for retry instead of silently dropping it.
+  useEffect(() => {
+    if (fetcher.state === "idle" && fetcher.data) {
+      onResolved({
+        messageId,
+        nonce: write.nonce,
+        action: fetcher.data.action,
+        error: fetcher.data.error,
+      });
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [fetcher.data, fetcher.state]);
+
+  // Also listen for the typed-yes intercept: when the merchant types "yes" in
+  // the composer, the parent broadcasts a reeve:approve event for each pending
+  // write. We submit from here (our own fetcher) so the typed path uses the
+  // same concurrency-safe route as the button click.
+  useEffect(() => {
+    const handler = (e: Event) => {
+      const d = (e as CustomEvent<{ nonce: string; tool: string; args: Record<string, unknown> }>).detail;
+      if (d.nonce !== write.nonce) return;
+      if (fetcher.state !== "idle") return; // already in-flight
+      fetcher.submit(
+        { tool: d.tool, args: d.args },
+        { method: "POST", action: "/app/chat/approve", encType: "application/json" },
+      );
+    };
+    window.addEventListener("reeve:approve", handler as EventListener);
+    return () => window.removeEventListener("reeve:approve", handler as EventListener);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [write.nonce]);
+
   const onApprove = () => {
     if (submitting) return;
-    setSubmitting(true);
-    // Reuse the approveFetcher. We need to track its target so we know where
-    // to slot the result when it lands. Done via approveFetcherRef on the parent.
-    window.dispatchEvent(new CustomEvent("reeve:approve", {
-      detail: { messageId, nonce: write.nonce, tool: write.tool, args: write.args },
-    }));
+    fetcher.submit(
+      { tool: write.tool, args: write.args },
+      { method: "POST", action: "/app/chat/approve", encType: "application/json" },
+    );
   };
-  useEffect(() => {
-    if (!submitting) return;
-    // Listen for the parent's resolution broadcast for THIS nonce.
-    const handler = (e: Event) => {
-      const d = (e as CustomEvent<{ nonce: string }>).detail;
-      if (d.nonce === write.nonce) {
-        setSubmitting(false);
-      }
-    };
-    window.addEventListener("reeve:approve-resolved", handler as EventListener);
-    return () => window.removeEventListener("reeve:approve-resolved", handler as EventListener);
-  }, [submitting, write.nonce]);
 
   return (
     <div style={{
@@ -1207,7 +1214,7 @@ function PendingWriteCard({ messageId, write, onResolved }: {
           Proposed write
         </span>
         <span style={{ flex: 1 }} />
-        <span style={{ fontSize: "10px", color: C.textMuted }}>Awaiting approval</span>
+        <span style={{ fontSize: "10px", color: C.textMuted }}>{submitting ? "Applying…" : "Awaiting approval"}</span>
       </div>
       <div style={{ fontSize: "13px", color: C.textPrimary, marginBottom: "10px", fontFamily: 'ui-monospace, "SF Mono", Menlo, monospace' }}>
         {write.summary}
