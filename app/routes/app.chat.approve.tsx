@@ -16,6 +16,11 @@ import { dispatch, isWriteTool, type ToolName, type ToolResult } from "../lib/ag
 import { logActivity } from "../lib/audit.server";
 
 const VALID_WRITE_TOOLS = ["update_inventory", "set_product_status", "update_price"];
+// Real Shopify gids look like "gid://shopify/Product/123456789". A pending write
+// that reaches Approve without one means the agent loop's fill step failed (or
+// the model emitted a placeholder that slipped through). Fail fast with a clear
+// message instead of letting GraphQL produce a cryptic "Invalid global id".
+const GID_RE = /^gid:\/\/shopify\/[A-Za-z]+\/\d+/;
 
 export const action = async ({ request }: ActionFunctionArgs) => {
   const { admin, session } = await authenticate.admin(request);
@@ -26,6 +31,16 @@ export const action = async ({ request }: ActionFunctionArgs) => {
 
   if (!tool || !VALID_WRITE_TOOLS.includes(tool) || !isWriteTool(tool)) {
     return Response.json({ error: `Unknown or non-write tool: ${tool ?? "(missing)"}` }, { status: 400 });
+  }
+
+  // Validate the target id is a real Shopify gid before dispatching. Which
+  // field is required depends on the tool.
+  const idField = tool === "set_product_status" ? "productId" : "variantId";
+  const idVal = args[idField];
+  if (typeof idVal !== "string" || !GID_RE.test(idVal)) {
+    return Response.json({
+      error: `This proposed write is missing a valid product id (got "${String(idVal)}"). Ask Reeve to search for the product again so it can target the right one.`,
+    }, { status: 400 });
   }
 
   const result: ToolResult = await dispatch(tool as ToolName, args, {

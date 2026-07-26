@@ -287,6 +287,17 @@ export async function runAgent(params: {
  * the merchant to scope the request; we surface the truncation in reasoning.
  */
 const MAX_BATCH = 25;
+/** A real Shopify global id looks like "gid://shopify/Product/123456789".
+ *  Anything else — "PLACEHOLDER", "DEMO-PLACEHOLDER", "TODO", "null", "123" —
+ *  is the model flagging "I don't have the real id, please fill it" and must
+ *  NOT short-circuit expansion. Without this check the live LLM emitting
+ *  productId:"PLACEHOLDER" was treated as a real id, bypassing the read-result
+ *  fill, and the Approve click then failed with "Invalid global id 'PLACEHOLDER'". */
+const GID_RE = /^gid:\/\/shopify\/[A-Za-z]+\/\d+/;
+function isRealGid(v: unknown): boolean {
+  return typeof v === "string" && GID_RE.test(v);
+}
+
 function expandWriteCall(
   toolName: string,
   args: Record<string, unknown>,
@@ -294,11 +305,18 @@ function expandWriteCall(
 ): Array<{ args: Record<string, unknown>; filledFromRead?: string }> {
   const out = { ...args };
 
-  // If the model already supplied the target id, no expansion needed.
+  // If the model already supplied a REAL Shopify gid, no expansion needed.
+  // (Placeholders like "PLACEHOLDER" / "DEMO-PLACEHOLDER" fall through to
+  // expansion so the read result fills them.)
   const hasId =
-    (toolName === "set_product_status" && typeof out.productId === "string" && out.productId) ||
-    ((toolName === "update_price" || toolName === "update_inventory") && typeof out.variantId === "string" && out.variantId);
+    (toolName === "set_product_status" && isRealGid(out.productId)) ||
+    ((toolName === "update_price" || toolName === "update_inventory") && isRealGid(out.variantId));
   if (hasId) return [{ args: out }];
+
+  // Clear any non-gid placeholder so it doesn't leak into a pending write when
+  // no read produced rows (the caller surfaces a single card from the args).
+  if (toolName === "set_product_status" && !isRealGid(out.productId)) delete out.productId;
+  if ((toolName === "update_price" || toolName === "update_inventory") && !isRealGid(out.variantId)) delete out.variantId;
 
   // Find the first read action that returned a non-empty product/variant list.
   const readWithRows = actions.find(
