@@ -542,7 +542,12 @@ export async function dispatch(
       case "chart_new_customers_over_time": {
         const a = schemas.chart_new_customers_over_time.parse(args);
         const days = a.days ?? 90;
-        const filter = `customer_date:>=-${days}d`;
+        // Shopify's `customers` query filter for "customer created since X" is
+        // `created_at:>=<date>`, which — like `processed_at` on the orders
+        // query — accepts relative syntax (`-90d`). The earlier `customer_date`
+        // attempt threw "Invalid timestamp for query filter `customer_date`,"
+        // because that filter name belongs to a different (REST-style) surface.
+        const filter = `created_at:>=-${days}d`;
         interface CustRow { createdAt: string }
         interface CustomersConn { customers: { edges: Array<{ node: CustRow }>; pageInfo: { hasNextPage: boolean; endCursor: string | null } } }
         const counts = new Map<string, number>();
