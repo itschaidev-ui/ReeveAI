@@ -612,13 +612,32 @@ export async function dispatch(
     }
   } catch (e) {
     const msg = (e as Error).message;
-    // Friendlier message for the most common chart failure: scope not granted.
+    // 1) Protected customer data — the merchant (or Shopify Partner Dashboard)
+    //    has NOT approved the app for Customer data. This is a distinct failure
+    //    mode: read_customers scope IS granted, but the app's distribution
+    //    hasn't cleared Shopify's protected-customer-data access policy
+    //    (https://shopify.dev/docs/apps/launch/protected-customer-data).
+    //    The fix is in Partner Dashboard → API access → Protected customer data
+    //    access, NOT a re-auth prompt.
+    if (/not approved to access the Customer/i.test(msg) || /protected customer data/i.test(msg)) {
+      return fail(
+        name, args,
+        "This app is not approved to read Customer data. Shopify treats customer records as protected. Open the app in your Shopify Partner Dashboard → API access → Protected customer data access, request the customers read access, then re-open the app in Shopify admin. The read_customers scope is already in .env — the gate is a separate approval policy.",
+        "Customer data access pending Partner-Dashboard approval",
+      );
+    }
+    // 2) Plain scope re-auth needed (read_orders missing / etc.).
     if (/access denied|FORBIDDEN|Requires access scope|read_orders/i.test(msg)) {
       return fail(name, args, scopeError("read_orders (or the relevant scope)"), `Chart unavailable — needs scope re-auth`);
     }
-    if (/read_customers/i.test(msg)) {
+    // 3) read_customers scope itself missing (different message from 1) — the
+    //    app does not even request read_customers. Today this shouldn't fire
+    //    because SCOPES includes read_customers, but we keep the trap for
+    //    safety in case the env line is later trimmed.
+    if (/read_customers|cannot access.*Customer/i.test(msg)) {
       return fail(name, args, scopeError("read_customers"), `Chart unavailable — needs scope re-auth`);
     }
+    // 4) Discount / price rules / reports scope missing.
     if (/read_discounts|read_price_rules|read_reports/i.test(msg)) {
       return fail(name, args, scopeError("read_discounts / read_price_rules / read_reports"), `Chart unavailable — needs scope re-auth`);
     }
