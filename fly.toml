@@ -1,0 +1,45 @@
+# fly.toml — Reeve AI single-merchant deployment (Path 1)
+# Generated for https://fly.io
+
+app = "reeve-ai"
+primary_region = "iad"
+
+[build]
+  dockerfile = "Dockerfile"
+
+# ─── HTTP ────────────────────────────────────────────────────────────────────
+[[services]]
+  internal_port = 3000
+  protocol = "tcp"
+  auto_stop_machines = false
+  auto_start_machines = true
+  min_machines_running = 1
+
+  [[services.ports]]
+    port = 443
+    handlers = ["tls", "http"]
+    force_https = true
+
+  [[services.ports]]
+    port = 80
+    handlers = ["http"]
+    force_https = true
+
+# ─── Data ────────────────────────────────────────────────────────────────────
+# SQLite persistent volume. Create before first deploy:
+#   fly volumes create data --region iad --size 1
+[[mounts]]
+  source = "data"
+  destination = "/data"
+
+# ─── Secrets (set with `fly secrets set KEY=VALUE`; never hardcode here) ─────
+# Required:
+#   SHOPIFY_API_KEY
+#   SHOPIFY_API_SECRET
+#   SHOPIFY_APP_URL
+#   SCOPES
+#   DATABASE_URL=file:/data/prod.sqlite
+#
+# Optional but recommended:
+#   NVIDIA_API_KEY
+#   SHOP_CUSTOM_DOMAIN (if merchant uses a custom Shopify domain)

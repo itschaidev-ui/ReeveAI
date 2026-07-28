@@ -1,3 +1,25 @@
+# Environment secrets
+.env
+.env.*
+!.env.example
+
+# SQLite dev database
+prisma/*.sqlite
+prisma/*.sqlite-journal
+prisma/*.db
+prisma/*.db-journal
+
+# Git
+.git
+
+# Build output (built fresh inside the image)
+build/
 .cache
-build
+
+# Node modules (reinstalled inside the image)
 node_modules
+
+# OS / IDE
+.DS_Store
+Thumbs.db
+*.swp
