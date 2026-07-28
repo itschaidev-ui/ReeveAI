@@ -156,6 +156,58 @@ async function gql<T>(admin: AdminClient, query: string, variables?: Record<stri
   return json.data as T;
 }
 
+// ─── ShopifyQL helper (read_reports scope gated) ────────────────────────────
+// ShopifyQL runs a server-side SQL-like aggregation that bypasses the 250/page
+// connection cap. We call shopifyqlQuery(query) → tableData { columns, rows }.
+// Columns is an array of header strings; rows is a parallel array of arrays
+// where each entry corresponds positionally to columns[]. Row values come back
+// as strings — including numeric/money values — so callers parse as needed.
+//
+// Returns null on ANY failure (parse error, scope denial, schema mismatch).
+// The two chart_* callers that use it FALL BACK to raw pagination when this
+// returns null, so merchants whose shop lacks read_reports (or whose API
+// version surfaces a different schema) still get a chart — just from the
+// paginated path instead of server-aggregated one.
+
+interface ShopifyQLTableData {
+  shopifyqlQuery?: {
+    parseErrors?: Array<{ message: string }>;
+    tableData?: { columns?: string[]; rows?: string[][] };
+  };
+}
+
+async function runShopifyQL(
+  admin: AdminClient,
+  query: string,
+): Promise<{ columns: string[]; rows: string[][] } | null> {
+  try {
+    const data = await gql<ShopifyQLTableData>(admin, `#graphql
+      query ShopifyQL($query: String!) {
+        shopifyqlQuery(query: $query) {
+          parseErrors { message }
+          tableData { columns rows }
+        }
+      }`, { query });
+    const q = data.shopifyqlQuery;
+    if (!q) return null;
+    if (q.parseErrors && q.parseErrors.length) return null;
+    if (!q.tableData?.columns || !q.tableData?.rows) return null;
+    return { columns: q.tableData.columns, rows: q.tableData.rows };
+  } catch {
+    // gql() throws on json.errors. Anything from "Requires read_reports scope"
+    // to "schema not found" lands here. Treat as fallback-blackhole.
+    return null;
+  }
+}
+
+/** Parse a string cell to a float (0 on missing/NaN); ShopifyQL returns money
+ *  and counts as string-positional columns, so we coerce defensively. */
+function toNumber(cell: string | undefined | null): number {
+  if (cell == null) return 0;
+  const n = parseFloat(cell.replace(/[^0-9.\-]/g, ""));
+  return isFinite(n) ? n : 0;
+}
+
 // ─── Pagination helpers (used by the chart_* / aggregate read tools) ─────────────
 // Shopify GraphQL connections are cursor-based (first/after, no offset) with a
 // hard cap of 250 rows per page and 1000 cost points per query. We cap at 4
@@ -369,6 +421,33 @@ export async function dispatch(
       case "chart_sales_over_time": {
         const a = schemas.chart_sales_over_time.parse(args);
         const days = a.days ?? 30;
+
+        // ── ShopifyQL path (preferred) ──────────────────────────────────────────
+        // FROM sales SHOW total_sales, gross_sales, returns TIMESERIES day SINCE -Nd
+        // Server-side aggregation — bypasses the 250/page connection ceiling.
+        // Falls back to raw pagination below on any failure.
+        const qlSales = await runShopifyQL(ctx.admin, `FROM sales SHOW total_sales, gross_sales, returns TIMESERIES day SINCE -${days}d`);
+        if (qlSales?.rows?.length && qlSales.columns?.length >= 2) {
+          const findCol = (name) => qlSales.columns.findIndex((c) => c.toLowerCase().includes(name.toLowerCase()));
+          const iDate = qlSales.columns.findIndex((c) => /date|day|month|time/i.test(c));
+          const iNet = findCol("total_sales");
+          const iGross = findCol("gross_sales");
+          const iRefunds = findCol("returns");
+          if (iDate >= 0 && (iNet >= 0 || iGross >= 0)) {
+            const points = qlSales.rows.map((r) => {
+              const date = (r[iDate] ?? "").slice(0, 10);
+              const gross = iGross >= 0 ? toNumber(r[iGross]) : 0;
+              const refunds = iRefunds >= 0 ? toNumber(r[iRefunds]) : 0;
+              const net = iNet >= 0 ? toNumber(r[iNet]) : gross - refunds;
+              return { date, net: Math.round(net * 100) / 100, gross: Math.round(gross * 100) / 100, refunds: Math.round(refunds * 100) / 100 };
+            }).sort((x, y) => x.date.localeCompare(y.date));
+            const totalNet = points.reduce((s, p) => s + p.net, 0);
+            const summary = `Daily net sales — last ${days} days · ${points.length} days · ${money(totalNet)}`;
+            return ok(name, args, { points, ordersCount: points.length, capped: false, viaSageQL: true }, summary);
+          }
+        }
+
+        // ── Fallback: raw order pagination ───────────────────────────────────────
         const filter = `processed_at:>=-${days}d`;
         interface OrderRow { processedAt: string; totalPriceSet: { shopMoney: { amount: string } }; totalRefundedSet: { shopMoney: { amount: string } } }
         interface OrdersConn { orders: { edges: Array<{ node: OrderRow }>; pageInfo: { hasNextPage: boolean; endCursor: string | null } } }
@@ -452,6 +531,33 @@ export async function dispatch(
       case "chart_revenue_by_dimension": {
         const a = schemas.chart_revenue_by_dimension.parse(args);
         const days = a.days ?? 30;
+
+        // ── ShopifyQL path (preferred) for product_type or vendor (the only
+        //    dimensions ShopifyQL exposes natively on the sales schema). status
+        //    and fulfillment_status fall through to raw pagination below.
+        const qlDim = a.dimension === "product_type" ? "product_type"
+          : a.dimension === "vendor" ? "vendor"
+          : null;
+        if (qlDim) {
+          const qlRev = await runShopifyQL(ctx.admin, `FROM sales SHOW total_sales BY ${qlDim} SINCE -${days}d`);
+          if (qlRev?.rows?.length && qlRev.columns?.length >= 2) {
+            const iLabel = qlRev.columns.findIndex((c) => /product_type|vendor|product|vendor/i.test(c.toLowerCase()));
+            const iVal = qlRev.columns.findIndex((c) => /sales|revenue|total_sales/i.test(c.toLowerCase()));
+            if (iLabel >= 0 && iVal >= 0) {
+              const slices = qlRev.rows
+                .map((r) => ({ label: String(r[iLabel] ?? "Unknown"), value: Math.round(toNumber(r[iVal]) * 100) / 100 }))
+                .filter((s) => s.value > 0)
+                .sort((x, y) => y.value - x.value);
+              const total = slices.reduce((s, x) => s + x.value, 0);
+              const top = slices[0];
+              const summary = `Revenue by ${a.dimension} — last ${days} days · ${slices.length} groups · ${money(total)} total${top ? ` · #1 ${top.label}` : ""}`;
+              return ok(name, args, { slices, dimension: a.dimension, total, capped: false, viaSageQL: true }, summary);
+            }
+          }
+        }
+
+        // ── Fallback: raw order pagination (status / fulfillment_status, or
+        //    if ShopifyQL path returned null for any reason above) ────────────────
         const filter = `processed_at:>=-${days}d`;
         interface LineRow { quantity: number; originalUnitPriceSet: { shopMoney: { amount: string } } | null; product: { productType: string; vendor: string; status: string } | null }
         interface OrdersConn { orders: { edges: Array<{ node: { displayFulfillmentStatus: string; lineItems: { edges: Array<{ node: LineRow }> } } }>; pageInfo: { hasNextPage: boolean; endCursor: string | null } } }
