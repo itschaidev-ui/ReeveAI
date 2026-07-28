@@ -428,7 +428,7 @@ export async function dispatch(
         // Falls back to raw pagination below on any failure.
         const qlSales = await runShopifyQL(ctx.admin, `FROM sales SHOW total_sales, gross_sales, returns TIMESERIES day SINCE -${days}d`);
         if (qlSales?.rows?.length && qlSales.columns?.length >= 2) {
-          const findCol = (name) => qlSales.columns.findIndex((c) => c.toLowerCase().includes(name.toLowerCase()));
+          const findCol = (name: string) => qlSales.columns.findIndex((c: string) => c.toLowerCase().includes(name.toLowerCase()));
           const iDate = qlSales.columns.findIndex((c) => /date|day|month|time/i.test(c));
           const iNet = findCol("total_sales");
           const iGross = findCol("gross_sales");
