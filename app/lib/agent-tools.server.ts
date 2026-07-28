@@ -687,25 +687,44 @@ export async function dispatch(
       case "chart_top_discounts_by_usage": {
         const a = schemas.chart_top_discounts_by_usage.parse(args);
         const limit = a.limit ?? 8;
-        interface PriceRuleRow { title: string; usageCount: number; totalSales: { amount: string } | null; status: string }
-        interface PriceRulesData { priceRules: { edges: Array<{ node: PriceRuleRow }>; pageInfo: { hasNextPage: boolean; endCursor: string | null } } }
-        const rows: PriceRuleRow[] = [];
+        interface DiscountRow { title: string | null; status: string; asyncUsageCount: number; totalSales: { amount: string } | null }
+        interface DiscountNodesData { discountNodes: { edges: Array<{ node: { discount: DiscountRow | null } }>; pageInfo: { hasNextPage: boolean; endCursor: string | null } } }
+        const rows: DiscountRow[] = [];
         let page = 0, cursor: string | null = null;
-        while (page < 2) { // discounts rarely exceed a few rows; cap at 2 pages
-          const data = await gql<PriceRulesData>(ctx.admin, `#graphql
-            query PriceRules($first: Int!, $after: String) {
-              priceRules(first: $first, after: $after) {
-                edges { node { title usageCount totalSales { amount } status } }
+        while (page < 2) {
+          const data = await gql<DiscountNodesData>(ctx.admin, `#graphql
+            query Discounts($first: Int!, $after: String) {
+              discountNodes(first: $first, after: $after) {
+                edges {
+                  node {
+                    discount {
+                      ... on DiscountCodeBasic {
+                        title status asyncUsageCount totalSales { amount }
+                      }
+                      ... on DiscountAutomaticBasic {
+                        title status asyncUsageCount totalSales { amount }
+                      }
+                      ... on DiscountCodeBxgy {
+                        title status asyncUsageCount totalSales { amount }
+                      }
+                      ... on DiscountAutomaticBxgy {
+                        title status asyncUsageCount totalSales { amount }
+                      }
+                    }
+                  }
+                }
                 pageInfo { hasNextPage endCursor }
               }
             }`, { first: Math.min(100, PAGE_SIZE), after: cursor });
-          for (const e of data.priceRules.edges) rows.push(e.node);
-          if (!data.priceRules.pageInfo.hasNextPage || !data.priceRules.pageInfo.endCursor) break;
-          cursor = data.priceRules.pageInfo.endCursor;
+          for (const e of data.discountNodes.edges) {
+            if (e.node.discount) rows.push(e.node.discount);
+          }
+          if (!data.discountNodes.pageInfo.hasNextPage || !data.discountNodes.pageInfo.endCursor) break;
+          cursor = data.discountNodes.pageInfo.endCursor;
           page++;
         }
         const bars = rows
-          .map((r) => ({ name: r.title || "Untitled", usage: r.usageCount ?? 0, sales: sumMoney([r.totalSales?.amount]), status: r.status }))
+          .map((r) => ({ name: r.title || "Untitled", usage: r.asyncUsageCount ?? 0, sales: sumMoney([r.totalSales?.amount]), status: r.status }))
           .sort((x, y) => y.usage - x.usage)
           .slice(0, limit);
         const top = bars[0];
